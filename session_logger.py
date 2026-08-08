@@ -114,7 +114,7 @@ class SessionLog:
         sys.stderr = _Tee(self._orig_stderr, self._file, self._on_line)
         return self
 
-    def __exit__(self, exc_type, exc_val, exc_tb):
+    def __exit__(self, exc_val):
         if self._file:
             stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             if exc_val:

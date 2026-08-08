@@ -55,6 +55,7 @@ class Automation:
 
     def __init__(self):
         self.config = self.read_json('config.json')
+        self.wait = WebDriverWait(self.driver, 30)
 
         if self.config:
             self.write_log_header("Marketing Bot started.")
@@ -169,62 +170,15 @@ class Automation:
 
     def search_business(self):
         self._log("Searching business...")
-        wait = WebDriverWait(self.driver, 30)
         self.random_sleep()
         # 1. Capture main window BEFORE navigation
-        main_window = self.driver.current_window_handle
         try:
             self.driver.get("https://www.google.com/search?q=business+near+me&sca_esv=96d7376529677af8&sxsrf=APpeQntaiUKW_-OjB3WCqp1fKjKx1gfBjw%3A1786182427405&source=hp&ei=G_t2avuSFrWQ-d8Py8WVyQc&iflsig=ABILxe8AAAAAancJKwWty64InQtJYOKfmWpc4YfZtnNB&udm=1&oq=business+&gs_lp=Egdnd3Mtd2l6IglidXNpbmVzcyAqAggAMgcQIxjwBRgnMgoQABiABBiKBRhDMgoQABiABBiKBRhDMgoQABiABBiKBRhDMg0QABiABBiKBRhDGLEDMg0QABiABBiKBRhDGLEDMg0QLhiABBiKBRhDGLEDMgoQABiABBiKBRhDMgoQABiABBiKBRhDMgoQABiABBiKBRhDSPMeUKoKWOkUcAF4AJABAJgBkAKgAfgOqgEFMC40LjW4AQHIAQD4AQGYAgqgApsPqAIKwgIHECMY6gIYJ8ICChAjGPAFGOoCGCfCAg0QIxiiBxieBhjqAhgnwgIEECMYJ8ICFhAuGEMYgwEYxwEYsQMY0QMYgAQYigXCAgUQABiABMICCBAAGIAEGLEDwgILEAAYgAQYigUYsQPCAgUQLhiABMICDhAuGIAEGLEDGMcBGK8BwgIKEC4YgAQYigUYQ8ICExAuGIAEGIoFGEMYsQMYxwEY0QPCAhAQLhiABBiKBRhDGMcBGNEDwgILEAAYgAQYigUYkgPCAhAQABiABBiKBRhDGLEDGMkDmAMH8QVgll9H_YyVOJIHBTEuNC41oAeaU7IHBTAuNC41uAeTD8IHBTAuOS4xyAcYgAgB&sclient=gws-wiz")
-            self.random_sleep()
-            # 3. Wait for new window OR same window redirect
-            wait.until(
-                lambda d: len(d.window_handles) >= 1
-            )
-            self.random_sleep()  # allow popup to fully spawn
-            # 4. If new window opened → switch
-            handles = self.driver.window_handles
-            self._log(f"All windows: {handles}")
-
-            if len(handles) > 1:
-                for handle in handles:
-                    if handle != main_window:
-                        self.driver.switch_to.window(handle)
-                        break
-            else:
-                self._log("No popup window, staying in main tab")
-
-            # 5. Confirm current page
-            self._log(f"Current URL: {self.driver.current_url}")
-
-            self._log("Switched to popup window:")
-            # 1. Switch to iframe
-            
-            iframes = self.driver.find_elements(By.CSS_SELECTOR, "iframe[src='showTop']")
-
-            if iframes:
-                self._log("already login detected")
-                return
-                
-            
-            self.type_input(By.ID,"username_txt", self.config.get('email', ''))
-            self.type_input(By.ID,"j_password", self.config.get('password', ''))
-            
-            login_button = wait.until(EC.element_to_be_clickable((By.ID, "btnLogin")))
-            self.scroll_to_element(login_button)
-            try:
-                login_button.click()
-            except Exception:
-                self.driver.execute_script(
-                    "arguments[0].click();",
-                    login_button
-                )
-
             self._log("Login successfully.")
+
+
         except Exception as e:
             self._log(f"could not login Error: {e}")
-
-
-        self._log("Login complete")
 
 
 
