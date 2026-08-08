@@ -19,10 +19,6 @@ import csv
 import re
 from urllib.parse import urljoin, urlparse
 
-from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
-
-
-
 
 
 
@@ -209,26 +205,56 @@ class Automation:
 
         self._close_browser_safely()
 
-
-
-    def search_business(self):
-        self._log("Searching business...")
-        self.random_sleep()
-        self.wait = WebDriverWait(self.driver, 30)
-        # 1. Capture main window BEFORE navigation
-        try:
-            self.driver.get("https://www.google.com/search?q=business+near+me&sca_esv=32b8bdd6e2d39944&hl=en&udm=1&lsack=Vjl3auavCsLj7_UPgdyI2AE&sa=X&ved=2ahUKEwjmsoy1m5GWAxXC8bsIHQEuAhsQjGp6BAguEAA&biw=1904&bih=380&dpr=1")
-            # self.driver.get("https://www.google.com/search?q=business+near+me&hl=en")
-            self._log("Login successfully.")
-            
-
-        except Exception as e:
-            self._log(f"could not login Error: {e}")
-
-
     # =========================================================
     # SEARCH BUSINESS ON GOOGLE
     # =========================================================
+
+    # def search_business(self):
+
+    #     self._log("Searching business...")
+
+    #     self.random_sleep()
+
+    #     self.wait = WebDriverWait(
+    #         self.driver,
+    #         30
+    #     )
+
+    #     try:
+
+    #         google_url = (
+    #             "https://www.google.com/search?q=business+near+me&sca_esv=32b8bdd6e2d39944&hl=en&udm=1&lsack=Vjl3auavCsLj7_UPgdyI2AE&sa=X&ved=2ahUKEwjmsoy1m5GWAxXC8bsIHQEuAhsQjGp6BAguEAA&biw=1904&bih=380&dpr=1"
+    #         )
+
+    #         self.driver.get(google_url)
+
+    #         self._log(
+    #             "Google search page opened successfully."
+    #         )
+    #         # Wait for Google results
+    #         try:
+
+    #             self.wait.until(
+    #                 EC.presence_of_element_located(
+    #                     (By.TAG_NAME, "body")
+    #                 )
+    #             )
+
+    #         except TimeoutException:
+
+    #             self._log(
+    #                 "Google page loaded but body was not found."
+    #             )
+
+    #         return self.driver
+
+    #     except Exception as e:
+
+    #         self._log(
+    #             f"Error opening Google: {e}"
+    #         )
+
+    #         return None
 
     def search_business(self):
 
@@ -244,50 +270,54 @@ class Automation:
         try:
 
             google_url = (
-                "https://www.google.com/search?"
-                "q=business+near+me"
+                "https://www.google.com/search"
+                "?q=business+near+me"
+                "&hl=en"
+            )
+
+            self._log(
+                f"Opening Google: {google_url}"
             )
 
             self.driver.get(google_url)
+
+            # Wait until page body exists
+            self.wait.until(
+                EC.presence_of_element_located(
+                    (By.TAG_NAME, "body")
+                )
+            )
 
             self._log(
                 "Google search page opened successfully."
             )
 
-            # Wait for Google results
-            try:
-
-                self.wait.until(
-                    EC.presence_of_element_located(
-                        (By.TAG_NAME, "body")
-                    )
-                )
-
-            except TimeoutException:
-
-                self._log(
-                    "Google page loaded but body was not found."
-                )
+            # Give Google a little time to render
+            self.random_sleep()
 
             return self.driver
+
+        except TimeoutException:
+
+            self._log(
+                "Google page loaded but body was not found."
+            )
+
+            return None
 
         except Exception as e:
 
             self._log(
-                f"Error opening Google: {e}"
+                f"Error opening Google: {type(e).__name__}: {e}"
             )
 
             return None
 
 
-    # =========================================================
-    # GOOGLE RESULTS
-    # =========================================================
-
     def get_google_websites(self, page):
 
         self._log(
-            "Finding website links from Google..."
+            "Finding business website links from Google..."
         )
 
         if page is None:
@@ -303,18 +333,29 @@ class Automation:
 
         try:
 
-            # Selenium:
-            # Find all <a href=""> elements
-            links = page.find_elements(
-                By.CSS_SELECTOR,
-                "a[href]"
+            # =====================================================
+            # METHOD 1
+            # New Google local/business results
+            #
+            # Google now creates:
+            #
+            # /goto?url=XXXXXXXX
+            #
+            # instead of directly giving:
+            #
+            # https://example.com
+            # =====================================================
+
+            website_links = page.find_elements(
+                By.XPATH,
+                "//a[.//span[normalize-space()='Website']]"
             )
 
             self._log(
-                f"Google returned {len(links)} links."
+                f"Found {len(website_links)} Google Website buttons."
             )
 
-            for link in links:
+            for link in website_links:
 
                 try:
 
@@ -323,17 +364,55 @@ class Automation:
                     if not href:
                         continue
 
-                    # Only HTTP / HTTPS
-                    if not href.startswith(
+                    # Convert relative URL to absolute Google URL
+                    if href.startswith("/"):
+                        href = urljoin(
+                            self.driver.current_url,
+                            href
+                        )
+
+                    self._log(
+                        f"Google Website link: {href}"
+                    )
+
+                    # =================================================
+                    # New Google /goto link
+                    # =================================================
+
+                    if "/goto?" in href:
+
+                        website_url = self.resolve_google_website(
+                            href
+                        )
+
+                    else:
+
+                        # Old/direct format
+                        website_url = href
+
+                    if not website_url:
+                        self._log(
+                            "Could not resolve website URL."
+                        )
+                        continue
+
+                    website_url = website_url.strip()
+
+                    if not website_url.startswith(
                         ("http://", "https://")
                     ):
                         continue
 
-                    parsed = urlparse(href)
+                    # Parse domain
+                    parsed = urlparse(website_url)
 
                     domain = parsed.netloc.lower()
 
-                    # Remove Google domains
+                    # Remove www
+                    if domain.startswith("www."):
+                        domain = domain[4:]
+
+                    # Ignore Google
                     if (
                         "google.com" in domain
                         or "google.ae" in domain
@@ -341,36 +420,123 @@ class Automation:
                     ):
                         continue
 
-                    # Remove Google tracking/ad URLs
-                    if "/aclk" in href:
+                    # Remove duplicate domains
+                    if domain in seen:
                         continue
 
-                    # Remove Google Maps
-                    if "google.com/maps" in href:
-                        continue
+                    seen.add(domain)
 
-                    # Remove duplicates
-                    if href in seen:
-                        continue
+                    # Try to get business name
+                    name = ""
 
-                    seen.add(href)
+                    try:
 
-                    # Store as dictionary
-                    # because process_website()
-                    # expects website["url"]
+                        parent = link.find_element(
+                            By.XPATH,
+                            "./ancestor::div[contains(@class,'w7Dbne')][1]"
+                        )
+
+                        name_element = parent.find_element(
+                            By.CSS_SELECTOR,
+                            ".dbg0pd .OSrXXb"
+                        )
+
+                        name = name_element.text.strip()
+
+                    except Exception:
+                        pass
+
                     websites.append({
-                        "name": "",
-                        "url": href
+                        "name": name,
+                        "url": website_url
                     })
+
+                    self._log(
+                        f"Website found: {name} -> {website_url}"
+                    )
 
                 except Exception as e:
 
                     self._log(
-                        f"Error reading Google link: {e}"
+                        f"Error reading Website button: {e}"
                     )
 
+            # =====================================================
+            # METHOD 2
+            # Fallback for older Google result format
+            # =====================================================
+
+            if not websites:
+
+                self._log(
+                    "No new-style Website buttons found."
+                )
+
+                self._log(
+                    "Trying fallback method for older Google results..."
+                )
+
+                links = page.find_elements(
+                    By.CSS_SELECTOR,
+                    "a[href]"
+                )
+
+                self._log(
+                    f"Google returned {len(links)} links."
+                )
+
+                for link in links:
+
+                    try:
+
+                        href = link.get_attribute("href")
+
+                        if not href:
+                            continue
+
+                        # Direct HTTP links
+                        if not href.startswith(
+                            ("http://", "https://")
+                        ):
+                            continue
+
+                        parsed = urlparse(href)
+
+                        domain = parsed.netloc.lower()
+
+                        if domain.startswith("www."):
+                            domain = domain[4:]
+
+                        # Ignore Google
+                        if (
+                            "google.com" in domain
+                            or "google.ae" in domain
+                            or "googleusercontent.com" in domain
+                        ):
+                            continue
+
+                        # Ignore Maps
+                        if "google.com/maps" in href:
+                            continue
+
+                        if domain in seen:
+                            continue
+
+                        seen.add(domain)
+
+                        websites.append({
+                            "name": "",
+                            "url": href
+                        })
+
+                    except Exception as e:
+
+                        self._log(
+                            f"Fallback link error: {e}"
+                        )
+
             self._log(
-                f"Found {len(websites)} website links."
+                f"Found {len(websites)} unique websites."
             )
 
             return websites
@@ -378,15 +544,96 @@ class Automation:
         except Exception as e:
 
             self._log(
-                f"Error finding Google websites: {e}"
+                f"Error finding Google websites: "
+                f"{type(e).__name__}: {e}"
             )
 
             return []
 
-
     # =========================================================
     # OPEN WEBSITE
     # =========================================================
+
+    # def open_website(self, website):
+
+    #     """
+    #     Opens a website in a NEW browser tab.
+    #     """
+
+    #     url = website.get(
+    #         "url",
+    #         ""
+    #     )
+
+    #     if not url:
+
+    #         self._log(
+    #             "Website URL is empty."
+    #         )
+
+    #         return None
+
+    #     self._log(
+    #         f"Opening website: {url}"
+    #     )
+
+    #     try:
+
+    #         # Save current tab
+    #         original_window = self.driver.current_window_handle
+
+    #         # Selenium 4:
+    #         # Open a new tab
+    #         self.driver.switch_to.new_window(
+    #             "tab"
+    #         )
+
+    #         # Open website
+    #         self.driver.get(url)
+
+    #         # Wait for page
+    #         try:
+
+    #             WebDriverWait(
+    #                 self.driver,
+    #                 15
+    #             ).until(
+    #                 EC.presence_of_element_located(
+    #                     (By.TAG_NAME, "body")
+    #                 )
+    #             )
+
+    #         except TimeoutException:
+
+    #             self._log(
+    #                 f"Page body timeout: {url}"
+    #             )
+
+    #         # Small random delay
+    #         self.random_sleep()
+
+    #         return {
+    #             "window_handle": self.driver.current_window_handle,
+    #             "original_window": original_window
+    #         }
+
+    #     except Exception as e:
+
+    #         self._log(
+    #             f"Error opening {url}: {e}"
+    #         )
+
+    #         # Try to close current tab
+    #         try:
+    #             if len(self.driver.window_handles) > 1:
+    #                 self.driver.close()
+    #                 self.driver.switch_to.window(
+    #                     original_window
+    #                 )
+    #         except Exception:
+    #             pass
+
+    #         return None
 
     def open_website(self, website):
 
@@ -411,13 +658,16 @@ class Automation:
             f"Opening website: {url}"
         )
 
+        original_window = None
+
         try:
 
             # Save current tab
-            original_window = self.driver.current_window_handle
+            original_window = (
+                self.driver.current_window_handle
+            )
 
-            # Selenium 4:
-            # Open a new tab
+            # Open new tab
             self.driver.switch_to.new_window(
                 "tab"
             )
@@ -425,7 +675,7 @@ class Automation:
             # Open website
             self.driver.get(url)
 
-            # Wait for page
+            # Wait for body
             try:
 
                 WebDriverWait(
@@ -443,32 +693,39 @@ class Automation:
                     f"Page body timeout: {url}"
                 )
 
-            # Small random delay
             self.random_sleep()
 
             return {
-                "window_handle": self.driver.current_window_handle,
-                "original_window": original_window
+                "window_handle":
+                    self.driver.current_window_handle,
+
+                "original_window":
+                    original_window
             }
 
         except Exception as e:
 
             self._log(
-                f"Error opening {url}: {e}"
+                f"Error opening {url}: "
+                f"{type(e).__name__}: {e}"
             )
 
-            # Try to close current tab
+            # Close failed tab
             try:
+
                 if len(self.driver.window_handles) > 1:
+
                     self.driver.close()
-                    self.driver.switch_to.window(
-                        original_window
-                    )
+
+                    if original_window:
+                        self.driver.switch_to.window(
+                            original_window
+                        )
+
             except Exception:
                 pass
 
             return None
-
 
     # =========================================================
     # FIND CONTACT PAGE
@@ -866,11 +1123,47 @@ class Automation:
                         f"Contact phones: {contact_phones}"
                     )
 
+                    
+
                 except Exception as e:
 
                     self._log(
                         f"Contact page error: {e}"
                     )
+
+            # -----------------------------------------
+            # GENERATE PROPOSAL
+            # -----------------------------------------
+
+            try:
+
+                self._log(
+                    "Generating website proposal..."
+                )
+
+                proposal = self.generate_website_proposal(
+                    website
+                )
+
+                if proposal:
+
+                    self._log("Proposal generated:")
+                    self._log(proposal)
+
+                    result["proposal"] = proposal
+
+                else:
+
+                    self._log(
+                        "Could not generate proposal."
+                    )
+
+            except Exception as e:
+
+                self._log(
+                    f"Proposal generation error: {e}"
+                )
+
 
             # -----------------------------------------
             # FINAL RESULT
@@ -963,7 +1256,8 @@ class Automation:
         # -----------------------------------------
         # Get websites from Google
         # -----------------------------------------
-
+        # self._log(google_page)
+        # input("get_google_websites")
         websites = self.get_google_websites(
             google_page
         )
@@ -1008,10 +1302,11 @@ class Automation:
                 result = self.process_website(
                     website
                 )
-
-                results.append(
-                    result
-                )
+                self._log(result)
+                input("first website ")
+                # results.append(
+                #     result
+                # )
 
             except Exception as e:
 
@@ -1038,6 +1333,584 @@ class Automation:
 
         return results
 
+    def resolve_google_website(self, google_url):
+
+        original_window = None
+
+        try:
+
+            original_window = self.driver.current_window_handle
+
+            self._log(
+                f"Resolving Google website link..."
+            )
+
+            # Open the Google redirect in a new tab
+            self.driver.switch_to.new_window("tab")
+
+            self.driver.get(google_url)
+
+            # Wait for navigation
+            try:
+
+                WebDriverWait(
+                    self.driver,
+                    15
+                ).until(
+                    lambda d: (
+                        d.current_url.startswith("http://")
+                        or d.current_url.startswith("https://")
+                    )
+                )
+
+            except TimeoutException:
+
+                self._log(
+                    "Timeout while resolving Google website."
+                )
+
+            final_url = self.driver.current_url
+
+            self._log(
+                f"Resolved URL: {final_url}"
+            )
+
+            # Close temporary tab
+            try:
+                self.driver.close()
+            except Exception:
+                pass
+
+            # Return to Google
+            try:
+                self.driver.switch_to.window(
+                    original_window
+                )
+            except Exception:
+                pass
+
+            # Check whether we actually reached a real website
+            if not final_url:
+                return None
+
+            if "google.com" in urlparse(
+                final_url
+            ).netloc.lower():
+
+                self._log(
+                    f"Still on Google, ignoring: {final_url}"
+                )
+
+                return None
+
+            if "google.ae" in urlparse(
+                final_url
+            ).netloc.lower():
+
+                return None
+
+            return final_url
+
+        except Exception as e:
+
+            self._log(
+                f"Error resolving Google website: {e}"
+            )
+
+            # Try to restore original tab
+            try:
+
+                if original_window:
+
+                    if self.driver.current_window_handle != original_window:
+
+                        try:
+                            self.driver.close()
+                        except Exception:
+                            pass
+
+                        self.driver.switch_to.window(
+                            original_window
+                        )
+
+            except Exception:
+                pass
+
+            return None
+
+
+    def ask_ai(self, content, domain, filename, Image=False):
+
+        # ============================================================
+        # API MODE
+        # ============================================================
+        # If OPENAI_API_KEY exists, use OpenAI API.
+        # Otherwise, use the existing Playwright method below.
+        # ============================================================
+
+        api_key = os.environ.get("OPENAI_API_KEY")
+
+        if api_key:
+
+            print("OPENAI_API_KEY found.")
+            print("Using OpenAI API mode.")
+
+            try:
+                from openai import OpenAI
+
+                client = OpenAI(api_key=api_key)
+
+                # ----------------------------------------------------
+                # Ask GPT-5.5 for the response
+                # ----------------------------------------------------
+                #
+                # json_object is used because your existing code expects
+                # the response to be JSON and then does json.loads().
+                #
+                # Your original content is passed directly without
+                # changing it.
+                # ----------------------------------------------------
+
+                response = client.responses.create(
+                    model="gpt-5.5",
+                    input=content,
+                    text={
+                        "format": {
+                            "type": "json_object"
+                        }
+                    }
+                )
+
+                response = response.output_text
+
+                self.log("writing ai response")
+                self.log(response)
+
+                # ----------------------------------------------------
+                # Make sure response exists
+                # ----------------------------------------------------
+
+                if response is None:
+                    raise Exception("Response is None")
+
+                response = response.strip()
+
+                if not response:
+                    raise Exception("Response is empty")
+
+                # ----------------------------------------------------
+                # Remove Markdown code fences if present
+                # ----------------------------------------------------
+
+                if response.startswith("```"):
+                    lines = response.splitlines()
+
+                    # Remove opening fence (``` or ```json)
+                    if lines and lines[0].startswith("```"):
+                        lines = lines[1:]
+
+                    # Remove closing fence
+                    if lines and lines[-1].startswith("```"):
+                        lines = lines[:-1]
+
+                    response = "\n".join(lines).strip()
+
+                print("Response received:")
+                print(response)
+
+                # ----------------------------------------------------
+                # Convert JSON response into Python object
+                # ----------------------------------------------------
+
+                try:
+                    analysis = json.loads(response)
+
+                except json.JSONDecodeError as e:
+                    print("JSON parsing failed")
+                    print("Error:", e)
+                    print("Raw response:")
+                    print(repr(response))
+                    raise
+
+                # ----------------------------------------------------
+                # Save JSON using your existing function
+                # ----------------------------------------------------
+
+                self.save_file(
+                    analysis,
+                    f"{domain}_{filename}"
+                )
+
+                # ----------------------------------------------------
+                # IMAGE GENERATION
+                # ----------------------------------------------------
+                #
+                # Only generate an image when Image=True.
+                #
+                # We use the same content as the image prompt.
+                # ----------------------------------------------------
+
+
+                if Image:
+
+                    print("Image=True")
+                    print("Generating image using OpenAI API...")
+
+                    image_response = client.responses.create(
+                        model="gpt-5.5",
+                        input=content,
+                        tools=[
+                            {
+                                "type": "image_generation"
+                            }
+                        ]
+                    )
+
+                    # ------------------------------------------------
+                    # Find image_generation_call in the response
+                    # ------------------------------------------------
+
+                    image_data = None
+
+                    for item in image_response.output:
+
+                        print("Response item type:", getattr(item, "type", None))
+
+                        if getattr(item, "type", None) == "image_generation_call":
+
+                            # The SDK normally exposes the generated image
+                            # as the "result" field.
+                            image_data = getattr(item, "result", None)
+
+                            print("Image result found:", bool(image_data))
+
+                            if image_data:
+                                break
+
+                    # ------------------------------------------------
+                    # If no image was found, print complete response
+                    # ------------------------------------------------
+
+                    if not image_data:
+
+                        print("FULL OPENAI RESPONSE:")
+                        print(image_response)
+
+                        raise Exception(
+                            "Image generation completed but no image data was returned."
+                        )
+
+                    # ------------------------------------------------
+                    # Create pictures directory
+                    # ------------------------------------------------
+
+                    pictures_dir = os.path.join(
+                        "data",
+                        "pictures"
+                    )
+
+                    os.makedirs(
+                        pictures_dir,
+                        exist_ok=True
+                    )
+
+                    # ------------------------------------------------
+                    # Keep your existing filename variables
+                    # ------------------------------------------------
+
+                    filename = f"{domain}_{filename}.png"
+
+                    filepath = os.path.join(
+                        pictures_dir,
+                        filename
+                    )
+
+                    # ------------------------------------------------
+                    # Decode base64 image and save it
+                    # ------------------------------------------------
+
+                    try:
+
+                        image_bytes = base64.b64decode(image_data)
+
+                        with open(filepath, "wb") as f:
+                            f.write(image_bytes)
+
+                        print("Saved:", filepath)
+
+                    except Exception as e:
+
+                        print("Error decoding image:")
+                        print(e)
+
+                        raise
+
+                    print("Saved:", filepath)
+
+                # ----------------------------------------------------
+                # Return exactly as your original function did
+                # ----------------------------------------------------
+
+                return response
+
+            except Exception as e:
+
+                print("OpenAI API error:")
+                print(str(e))
+
+                # Do NOT silently switch to Playwright here.
+                #
+                # This is intentional:
+                # If an API key exists but the API fails, you should
+                # know about the API error rather than accidentally
+                # running the browser version.
+                #
+                raise
+
+        # ============================================================
+        # EXISTING PLAYWRIGHT MODE
+        # ============================================================
+        #
+        # No OPENAI_API_KEY was found.
+        #
+        # Your original method is used.
+        # ============================================================
+
+        print("OPENAI_API_KEY not found.")
+        print("Using existing ChatGPT browser mode.")
+
+        with sync_playwright() as p:
+
+            browser = p.chromium.launch(
+                headless=False
+            )
+
+            context = browser.new_context(
+                permissions=[
+                    "clipboard-read",
+                    "clipboard-write"
+                ]
+            )
+
+            page = context.new_page()
+
+            page.goto(
+                "https://chat.openai.com"
+            )
+
+            page.wait_for_timeout(5000)
+
+            editor = page.locator(
+                "[contenteditable='true']"
+            )
+
+            editor.wait_for(
+                state="visible",
+                timeout=30000
+            )
+
+            # editor.fill(content)
+            editor.click()
+
+            page.keyboard.insert_text(content)
+
+            # time.sleep(3)
+            page.wait_for_timeout(5000)
+
+            page.keyboard.press("Enter")
+
+            page.wait_for_timeout(10000)
+
+            copy_button = page.locator(
+                'button[aria-label="Copy response"]'
+            ).last
+
+            copy_button.wait_for(
+                state="visible",
+                timeout=30000
+            )
+
+            copy_button.scroll_into_view_if_needed()
+
+            copy_button.click()
+
+            page.wait_for_timeout(1000)
+
+            response = page.evaluate(
+                "navigator.clipboard.readText()"
+            )
+
+            self.log("writing ai response")
+            self.log(response)
+
+            # Make sure response exists
+            if response is None:
+                raise Exception("Response is None")
+
+            response = response.strip()
+
+            if not response:
+                raise Exception("Response is empty")
+
+            # Remove Markdown code fences if present
+            if response.startswith("```"):
+
+                lines = response.splitlines()
+
+                # Remove opening fence (``` or ```json)
+                if lines and lines[0].startswith("```"):
+                    lines = lines[1:]
+
+                # Remove closing fence
+                if lines and lines[-1].startswith("```"):
+                    lines = lines[:-1]
+
+                response = "\n".join(lines).strip()
+
+            print("Response received:")
+            print(response)
+
+            try:
+                analysis = json.loads(response)
+
+            except json.JSONDecodeError as e:
+
+                print("JSON parsing failed")
+                print("Error:", e)
+                print("Raw response:")
+                print(repr(response))
+
+                raise
+
+            self.save_file(
+                analysis,
+                f"{domain}_{filename}"
+            )
+
+            if Image:
+
+                # Wait until ChatGPT finishes generating
+                page.locator(
+                    'button[aria-label="Stop generating"]'
+                ).wait_for(
+                    state="hidden"
+                )
+
+                # Wait until Download button exists
+                download_btn = page.locator(
+                    'button[aria-label="Download"]'
+                ).last
+
+                download_btn.wait_for(
+                    state="visible",
+                    timeout=120000
+                )
+
+                pictures_dir = os.path.join(
+                    "data",
+                    "pictures"
+                )
+
+                os.makedirs(
+                    pictures_dir,
+                    exist_ok=True
+                )
+
+                filename = f"{domain}_{filename}.png"
+
+                filepath = os.path.join(
+                    pictures_dir,
+                    filename
+                )
+
+                # Download image
+                with page.expect_download() as download_info:
+
+                    download_btn.click()
+
+                download = download_info.value
+
+                download.save_as(
+                    filepath
+                )
+
+                print("Saved:", filepath)
+
+            browser.close()
+
+            return response
+
+
+
+    def generate_website_proposal(self, website):
+        """
+        Generate a professional website-development proposal
+        based on the business information.
+        """
+
+        company_name = website.get("name", "")
+        website_url = website.get("url", "")
+
+        prompt = f"""
+    You are helping a professional website development company
+    write a short business introduction for a potential client.
+
+    Business name:
+    {company_name}
+
+    Website:
+    {website_url}
+
+    Our company provides:
+
+    - Website Development
+    - E-commerce / Online Stores
+    - Website Redesign
+    - Responsive Mobile-Friendly Websites
+    - SEO & Digital Marketing
+    - Logo Design
+    - Business Email Setup
+    - Accounting Software
+    - POS Solutions
+    - E-Invoicing Software
+    - Website Maintenance & Support
+    - Domain & Hosting Setup
+    - Custom Business Software
+
+    Write a professional and friendly proposal that can be used
+    as a draft for a website contact form.
+
+    IMPORTANT:
+
+    - Do not pretend that we know the company's specific problems.
+    - Do not make false claims about their current website.
+    - Do not say that we noticed problems unless they are explicitly
+    provided.
+    - Keep it relatively short.
+    - Sound human, professional and helpful.
+    - Do not use excessive marketing language.
+    - Do not use emojis.
+    - Do not mention that AI wrote the message.
+    - Invite them to contact us if they are interested.
+    - Mention that we can discuss their requirements and provide
+    suitable recommendations.
+    - Do not include a fake phone number, email address or website.
+    - Do not include a subject line unless specifically requested.
+
+    Return ONLY the proposal text.
+    """
+
+        return self.ask_ai(
+            prompt,
+            domain=company_name,
+            filename="proposal"
+        )
+
+
+
+
+
+        
 if __name__ == "__main__":
     print("[Marketing Bot] Launching Automation...")
     automation = Automation()
