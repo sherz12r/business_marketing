@@ -1,0 +1,15 @@
+venv/
+.idea
+*.pyc
+__pycache__
+logs/
+config.json
+billing.json
+build/
+dist/
+*.manifest
+*.png
+*.spec
+chrome_profile/
+*.txt
+.env
