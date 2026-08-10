@@ -4,3 +4,5 @@ scrapling==0.4.7
 cloakbrowser
 undetected_chromedriver==3.5.5
 PyInstaller
+openai
+python-dotenv

@@ -18,7 +18,8 @@ import asyncio
 import csv
 import re
 from urllib.parse import urljoin, urlparse
-
+from playwright.sync_api import sync_playwright
+from dotenv import load_dotenv
 
 
 
@@ -29,6 +30,9 @@ try:
     _HAS_CLOAK = True
 except ImportError:
     _HAS_CLOAK = False
+
+
+load_dotenv()
 
 
 class Automation:
@@ -270,9 +274,7 @@ class Automation:
         try:
 
             google_url = (
-                "https://www.google.com/search"
-                "?q=business+near+me"
-                "&hl=en"
+                "https://www.google.com/search?q=business+near+me&sca_esv=32b8bdd6e2d39944&hl=en&udm=1&lsack=Vjl3auavCsLj7_UPgdyI2AE&sa=X&ved=2ahUKEwjmsoy1m5GWAxXC8bsIHQEuAhsQjGp6BAguEAA&biw=1904&bih=380&dpr=1"
             )
 
             self._log(
@@ -975,7 +977,7 @@ class Automation:
             ""
         )
 
-        self.write_log_header(
+        self._log(
             f"Processing: {url}"
         )
 
@@ -1150,6 +1152,40 @@ class Automation:
                     self._log("Proposal generated:")
                     self._log(proposal)
 
+                    contact_name = os.environ.get("CONTACT_US_NAME", "").strip()
+                    contact_email = os.environ.get("CONTACT_US_EMAIL", "").strip()
+                    contact_phone = os.environ.get("CONTACT_US_PHONE", "").strip()
+
+                    self._log(
+                        f"Contact name configured: {bool(contact_name)}"
+                    )
+
+                    self._log(
+                        f"Contact email configured: {bool(contact_email)}"
+                    )
+
+                    self._log(
+                        f"Contact phone configured: {bool(contact_phone)}"
+                    )
+
+                    form_found = self.fill_contact_form(
+                        name=contact_name,
+                        email=contact_email,
+                        phone=contact_phone,
+                        message=proposal
+                    )
+
+                    if form_found:
+
+                        self._log(
+                            "Contact form filled successfully."
+                        )
+
+                        self._log(
+                            "Waiting for confirmation before submission."
+                        )
+                        input("waiting click")
+
                     result["proposal"] = proposal
 
                 else:
@@ -1158,6 +1194,8 @@ class Automation:
                         "Could not generate proposal."
                     )
 
+                input("FDSAFDS")
+
             except Exception as e:
 
                 self._log(
@@ -1165,6 +1203,8 @@ class Automation:
                 )
 
 
+            input("FDSAFDS")
+            
             # -----------------------------------------
             # FINAL RESULT
             # -----------------------------------------
@@ -1177,6 +1217,8 @@ class Automation:
                 self._log(
                     "✓ Contact information found"
                 )
+                input("FDSAFDS")
+
 
             else:
 
@@ -1303,7 +1345,6 @@ class Automation:
                     website
                 )
                 self._log(result)
-                input("first website ")
                 # results.append(
                 #     result
                 # )
@@ -1483,8 +1524,8 @@ class Automation:
 
                 response = response.output_text
 
-                self.log("writing ai response")
-                self.log(response)
+                self._log("writing ai response")
+                self._log(response)
 
                 # ----------------------------------------------------
                 # Make sure response exists
@@ -1531,15 +1572,6 @@ class Automation:
                     print("Raw response:")
                     print(repr(response))
                     raise
-
-                # ----------------------------------------------------
-                # Save JSON using your existing function
-                # ----------------------------------------------------
-
-                self.save_file(
-                    analysis,
-                    f"{domain}_{filename}"
-                )
 
                 # ----------------------------------------------------
                 # IMAGE GENERATION
@@ -1740,8 +1772,8 @@ class Automation:
                 "navigator.clipboard.readText()"
             )
 
-            self.log("writing ai response")
-            self.log(response)
+            self._log("writing ai response")
+            self._log(response)
 
             # Make sure response exists
             if response is None:
@@ -1769,23 +1801,6 @@ class Automation:
 
             print("Response received:")
             print(response)
-
-            try:
-                analysis = json.loads(response)
-
-            except json.JSONDecodeError as e:
-
-                print("JSON parsing failed")
-                print("Error:", e)
-                print("Raw response:")
-                print(repr(response))
-
-                raise
-
-            self.save_file(
-                analysis,
-                f"{domain}_{filename}"
-            )
 
             if Image:
 
@@ -1907,6 +1922,807 @@ class Automation:
         )
 
 
+    def normalize_text(self, text):
+        """
+        Normalize text so that comparisons are easier.
+        """
+
+        if not text:
+            return ""
+
+        text = str(text).lower()
+
+        # Replace common separators with spaces
+        text = re.sub(r"[_\-]+", " ", text)
+
+        # Remove extra whitespace
+        text = re.sub(r"\s+", " ", text)
+
+        return text.strip()
+
+
+    def get_element_information(self, element):
+        """
+        Collect all useful information from a form element.
+
+        This helps us identify fields even when websites
+        use different names.
+        """
+
+        values = []
+
+        try:
+            attributes = [
+                "name",
+                "id",
+                "placeholder",
+                "aria-label",
+                "autocomplete",
+                "title",
+                "type"
+            ]
+
+            for attribute in attributes:
+
+                try:
+
+                    value = element.get_attribute(
+                        attribute
+                    )
+
+                    if value:
+                        values.append(
+                            self.normalize_text(value)
+                        )
+
+                except Exception:
+                    pass
+
+            # -----------------------------------------
+            # Get associated label
+            # -----------------------------------------
+
+            try:
+
+                element_id = element.get_attribute("id")
+
+                if element_id:
+
+                    labels = self.driver.find_elements(
+                        By.XPATH,
+                        f"//label[@for='{element_id}']"
+                    )
+
+                    for label in labels:
+
+                        try:
+
+                            label_text = label.text
+
+                            if label_text:
+                                values.append(
+                                    self.normalize_text(
+                                        label_text
+                                    )
+                                )
+
+                        except Exception:
+                            pass
+
+            except Exception:
+                pass
+
+            # -----------------------------------------
+            # Get parent/container text
+            # -----------------------------------------
+
+            try:
+
+                parent = element.find_element(
+                    By.XPATH,
+                    "./ancestor::*[self::div or self::p or self::label][1]"
+                )
+
+                parent_text = parent.text
+
+                if parent_text:
+
+                    values.append(
+                        self.normalize_text(
+                            parent_text
+                        )
+                    )
+
+            except Exception:
+                pass
+
+        except Exception:
+            pass
+
+        # Remove empty values
+        values = [
+            value
+            for value in values
+            if value
+        ]
+
+        return " ".join(values)
+
+
+
+    def find_contact_form(self):
+        """
+        Find a likely contact form on the current page.
+        """
+
+        self._log("Looking for contact form...")
+
+        try:
+            forms = self.driver.find_elements(
+                By.TAG_NAME,
+                "form"
+            )
+
+            if not forms:
+                self._log("No forms found on page.")
+                return None
+
+            # First try to find a form that looks like a contact form
+            for form in forms:
+
+                try:
+                    form_text = form.text.lower()
+
+                    # Check inputs inside this form
+                    inputs = form.find_elements(
+                        By.CSS_SELECTOR,
+                        "input, textarea, select"
+                    )
+
+                    field_names = []
+
+                    for field in inputs:
+
+                        try:
+                            field_name = (
+                                field.get_attribute("name")
+                                or ""
+                            ).lower()
+
+                            field_id = (
+                                field.get_attribute("id")
+                                or ""
+                            ).lower()
+
+                            placeholder = (
+                                field.get_attribute("placeholder")
+                                or ""
+                            ).lower()
+
+                            aria_label = (
+                                field.get_attribute("aria-label")
+                                or ""
+                            ).lower()
+
+                            field_names.append(
+                                f"{field_name} "
+                                f"{field_id} "
+                                f"{placeholder} "
+                                f"{aria_label}"
+                            )
+
+                        except Exception:
+                            continue
+
+                    combined = (
+                        form_text
+                        + " "
+                        + " ".join(field_names)
+                    )
+
+                    contact_words = [
+                        "contact",
+                        "message",
+                        "email",
+                        "phone",
+                        "enquiry",
+                        "inquiry",
+                        "your-name",
+                        "your-email"
+                    ]
+
+                    matches = sum(
+                        1
+                        for word in contact_words
+                        if word in combined
+                    )
+
+                    if matches >= 2:
+
+                        self._log(
+                            "Contact form found."
+                        )
+
+                        return form
+
+                except Exception as e:
+
+                    self._log(
+                        f"Error checking form: {e}"
+                    )
+
+            # If we couldn't identify one specifically,
+            # use the first form that contains an email field.
+            for form in forms:
+
+                try:
+
+                    email_fields = form.find_elements(
+                        By.CSS_SELECTOR,
+                        "input[type='email']"
+                    )
+
+                    if email_fields:
+
+                        self._log(
+                            "Form with email field found."
+                        )
+
+                        return form
+
+                except Exception:
+                    continue
+
+            self._log(
+                "Contact form not found."
+            )
+
+            return None
+
+        except Exception as e:
+
+            self._log(
+                f"Error finding contact form: {e}"
+            )
+
+            return None
+
+
+    def find_form_field(
+        self,
+        form,
+        keywords,
+        field_type=None
+    ):
+        """
+        Find a form field using multiple methods.
+
+        Checks:
+        - name
+        - id
+        - placeholder
+        - aria-label
+        - label text
+        """
+
+        if form is None:
+            return None
+
+        try:
+
+            # -----------------------------------------
+            # Get all possible form fields
+            # -----------------------------------------
+
+            fields = form.find_elements(
+                By.CSS_SELECTOR,
+                "input, textarea, select"
+            )
+
+            if not fields:
+                return None
+
+            # -----------------------------------------
+            # Normalize keywords
+            # -----------------------------------------
+
+            normalized_keywords = []
+
+            for keyword in keywords:
+
+                if keyword:
+
+                    normalized_keywords.append(
+                        keyword.lower().replace(
+                            "_",
+                            "-"
+                        ).replace(
+                            " ",
+                            "-"
+                        )
+                    )
+
+            # -----------------------------------------
+            # Check every field
+            # -----------------------------------------
+
+            for field in fields:
+
+                try:
+
+                    # Ignore hidden fields
+                    field_type_value = (
+                        field.get_attribute("type")
+                        or ""
+                    ).lower()
+
+                    if field_type_value == "hidden":
+                        continue
+
+                    # ---------------------------------
+                    # Field attributes
+                    # ---------------------------------
+
+                    name = (
+                        field.get_attribute("name")
+                        or ""
+                    ).lower()
+
+                    field_id = (
+                        field.get_attribute("id")
+                        or ""
+                    ).lower()
+
+                    placeholder = (
+                        field.get_attribute(
+                            "placeholder"
+                        )
+                        or ""
+                    ).lower()
+
+                    aria_label = (
+                        field.get_attribute(
+                            "aria-label"
+                        )
+                        or ""
+                    ).lower()
+
+                    # ---------------------------------
+                    # Get associated label
+                    # ---------------------------------
+
+                    label_text = ""
+
+                    try:
+
+                        field_id_value = (
+                            field.get_attribute("id")
+                        )
+
+                        if field_id_value:
+
+                            labels = form.find_elements(
+                                By.CSS_SELECTOR,
+                                f"label[for='{field_id_value}']"
+                            )
+
+                            if labels:
+
+                                label_text = (
+                                    labels[0].text
+                                    or ""
+                                ).lower()
+
+                    except Exception:
+                        pass
+
+                    # ---------------------------------
+                    # Also check parent label
+                    # ---------------------------------
+
+                    try:
+
+                        parent_label = field.find_element(
+                            By.XPATH,
+                            "./ancestor::label[1]"
+                        )
+
+                        if parent_label:
+
+                            label_text += " " + (
+                                parent_label.text
+                                or ""
+                            ).lower()
+
+                    except Exception:
+                        pass
+
+                    # ---------------------------------
+                    # Combine everything
+                    # ---------------------------------
+
+                    values = [
+                        name,
+                        field_id,
+                        placeholder,
+                        aria_label,
+                        label_text
+                    ]
+
+                    combined = " ".join(
+                        values
+                    )
+
+                    # Normalize
+                    combined = (
+                        combined
+                        .replace("_", "-")
+                        .replace(" ", "-")
+                    )
+
+                    # ---------------------------------
+                    # Field type matching
+                    # ---------------------------------
+
+                    if field_type:
+
+                        if field_type == "email":
+
+                            if field_type_value != "email":
+
+                                # Still allow fields whose
+                                # name clearly says email
+                                if "email" not in combined:
+                                    continue
+
+                        elif field_type == "tel":
+
+                            if field_type_value not in [
+                                "tel",
+                                "text"
+                            ]:
+
+                                if not any(
+                                    x in combined
+                                    for x in [
+                                        "phone",
+                                        "telephone",
+                                        "mobile",
+                                        "tel"
+                                    ]
+                                ):
+                                    continue
+
+                        elif field_type == "textarea":
+
+                            if field.tag_name.lower() != "textarea":
+                                continue
+
+                    # ---------------------------------
+                    # Keyword matching
+                    # ---------------------------------
+
+                    for keyword in normalized_keywords:
+
+                        if keyword in combined:
+
+                            self._log(
+                                f"Matched field: "
+                                f"name='{name}', "
+                                f"id='{field_id}', "
+                                f"placeholder='{placeholder}'"
+                            )
+
+                            return field
+
+                except Exception:
+                    continue
+
+            return None
+
+        except Exception as e:
+
+            self._log(
+                f"find_form_field error: {e}"
+            )
+
+            return None
+
+
+    def fill_contact_form(
+        self,
+        name,
+        email,
+        phone,
+        message,
+        subject="Website Enquiry"
+    ):
+        """
+        Generic contact form filler.
+
+        Attempts to work with different website
+        contact forms by detecting fields using:
+
+        - name
+        - id
+        - placeholder
+        - aria-label
+        - label
+        """
+
+        self._log(
+            "Looking for contact form..."
+        )
+
+        form = self.find_contact_form()
+
+        if not form:
+
+            self._log(
+                "Contact form not found."
+            )
+
+            return False
+
+        self._log(
+            "Contact form found."
+        )
+
+        filled_count = 0
+
+        # =====================================================
+        # NAME
+        # =====================================================
+
+        try:
+
+            name_field = self.find_form_field(
+                form,
+                [
+                    "name",
+                    "full-name",
+                    "fullname",
+                    "your-name",
+                    "your_name",
+                    "first-name",
+                    "firstname"
+                ]
+            )
+
+            if name_field:
+
+                name_field.clear()
+
+                name_field.send_keys(
+                    name
+                )
+
+                filled_count += 1
+
+                self._log(
+                    "Name field filled."
+                )
+
+            else:
+
+                self._log(
+                    "Name field not found."
+                )
+
+        except Exception as e:
+
+            self._log(
+                f"Name field error: {e}"
+            )
+
+        # =====================================================
+        # EMAIL
+        # =====================================================
+
+        try:
+
+            email_field = self.find_form_field(
+                form,
+                [
+                    "email",
+                    "e-mail",
+                    "your-email",
+                    "your_email",
+                    "email-address",
+                    "emailaddress"
+                ],
+                field_type="email"
+            )
+
+            if email_field:
+
+                email_field.clear()
+
+                email_field.send_keys(
+                    email
+                )
+
+                filled_count += 1
+
+                self._log(
+                    "Email field filled."
+                )
+
+            else:
+
+                self._log(
+                    "Email field not found."
+                )
+
+        except Exception as e:
+
+            self._log(
+                f"Email field error: {e}"
+            )
+
+        # =====================================================
+        # PHONE
+        # =====================================================
+
+        try:
+
+            phone_field = self.find_form_field(
+                form,
+                [
+                    "phone",
+                    "telephone",
+                    "mobile",
+                    "tel",
+                    "your-phone",
+                    "your_phone",
+                    "phone-number",
+                    "phonenumber"
+                ],
+                field_type="tel"
+            )
+
+            if phone_field:
+
+                phone_field.clear()
+
+                phone_field.send_keys(
+                    phone
+                )
+
+                filled_count += 1
+
+                self._log(
+                    "Phone field filled."
+                )
+
+            else:
+
+                self._log(
+                    "Phone field not found."
+                )
+
+        except Exception as e:
+
+            self._log(
+                f"Phone field error: {e}"
+            )
+
+        # =====================================================
+        # SUBJECT
+        # =====================================================
+
+        try:
+
+            subject_field = self.find_form_field(
+                form,
+                [
+                    "subject",
+                    "your-subject",
+                    "your_subject",
+                    "topic",
+                    "title"
+                ]
+            )
+
+            if subject_field:
+
+                subject_field.clear()
+
+                subject_field.send_keys(
+                    subject
+                )
+
+                filled_count += 1
+
+                self._log(
+                    "Subject field filled."
+                )
+
+            else:
+
+                self._log(
+                    "Subject field not found."
+                )
+
+        except Exception as e:
+
+            self._log(
+                f"Subject field error: {e}"
+            )
+
+        # =====================================================
+        # MESSAGE
+        # =====================================================
+
+        try:
+
+            message_field = self.find_form_field(
+                form,
+                [
+                    "message",
+                    "comment",
+                    "comments",
+                    "enquiry",
+                    "inquiry",
+                    "your-message",
+                    "your_message",
+                    "message-body",
+                    "description",
+                    "details"
+                ],
+                field_type="textarea"
+            )
+
+            if message_field:
+
+                message_field.clear()
+
+                message_field.send_keys(
+                    message
+                )
+
+                filled_count += 1
+
+                self._log(
+                    "Message field filled."
+                )
+
+            else:
+
+                self._log(
+                    "Message field not found."
+                )
+
+        except Exception as e:
+
+            self._log(
+                f"Message field error: {e}"
+            )
+
+        # =====================================================
+        # RESULT
+        # =====================================================
+
+        self._log(
+            f"Form fields filled: {filled_count}"
+        )
+
+        if filled_count == 0:
+
+            self._log(
+                "✗ Could not fill any form fields."
+            )
+
+            return False
+
+        self._log(
+            f"✓ Successfully filled "
+            f"{filled_count} form fields."
+        )
+
+        return True
+
+    
 
 
 
