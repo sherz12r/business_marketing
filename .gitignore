@@ -14,3 +14,4 @@ chrome_profile/
 *.txt
 .env
 !requirements.txt
+data/
