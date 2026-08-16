@@ -17,6 +17,11 @@ import os, json, sys
 import asyncio
 import csv
 import re
+import base64
+import sqlite3
+import hashlib
+from pathlib import Path
+from urllib.parse import quote_plus
 from urllib.parse import urljoin, urlparse
 from playwright.sync_api import sync_playwright
 from dotenv import load_dotenv
@@ -70,6 +75,17 @@ class Automation:
             self._log("Warning: config.json is missing or empty — check your dashboard settings.")
 
         self.headless = bool(self.config.get('headless', False))
+        self.limit = max(1, int(self.config.get('limit', 10)))
+        self.search_query = str(self.config.get('search_query', 'business near me')).strip()
+        self.data_dir = Path(self.config.get('data_dir', 'data'))
+        self.data_dir.mkdir(parents=True, exist_ok=True)
+        self.db = sqlite3.connect(self.data_dir / 'outreach.sqlite3')
+        self.db.execute('''CREATE TABLE IF NOT EXISTS outreach (
+            business_key TEXT PRIMARY KEY, business_name TEXT, website TEXT,
+            contact_page TEXT, emails TEXT, phones TEXT, proposal TEXT,
+            form_prefilled INTEGER DEFAULT 0, status TEXT, updated_at TEXT
+        )''')
+        self.db.commit()
         browser_mode = "headless (no window)" if self.headless else "visible"
         self._log(f"Opening Chrome browser — {browser_mode}...")
         try:
@@ -171,11 +187,14 @@ class Automation:
         try:
             if self.driver:
                 self.driver.quit()
-                self._log("Browser Quited.")
-                sys.exit(1)
+                self._log("Browser closed.")
         except Exception:
             pass
         self.driver = None
+        try:
+            self.db.close()
+        except Exception:
+            pass
 
 
     
@@ -196,13 +215,22 @@ class Automation:
         # Process websites
         results = self.process_all_websites(
             google_page,
-            limit=20
+            limit=self.limit
         )
 
         self._log(
             f"Automation completed. "
             f"Total websites processed: {len(results)}"
         )
+
+        if (
+            not self.headless
+            and any(item.get("form_prefilled") for item in results)
+        ):
+            input(
+                "Review the prefilled contact-form tabs. Submit only where appropriate, "
+                "then press Enter to close the browser..."
+            )
 
         # Debug pause if you want
         # input("Press Enter to close browser...")
@@ -273,9 +301,7 @@ class Automation:
 
         try:
 
-            google_url = (
-                "https://www.google.com/search?q=business+near+me&sca_esv=32b8bdd6e2d39944&hl=en&udm=1&lsack=Vjl3auavCsLj7_UPgdyI2AE&sa=X&ved=2ahUKEwjmsoy1m5GWAxXC8bsIHQEuAhsQjGp6BAguEAA&biw=1904&bih=380&dpr=1"
-            )
+            google_url = "https://www.google.com/search?q=" + quote_plus(self.search_query)
 
             self._log(
                 f"Opening Google: {google_url}"
@@ -540,6 +566,22 @@ class Automation:
             self._log(
                 f"Found {len(websites)} unique websites."
             )
+
+            # Include visible Google business cards that have no website.
+            # These can still be drafted for review when Google exposes a phone.
+            known_names = {item.get("name", "").strip().lower() for item in websites}
+            for card in page.find_elements(By.CSS_SELECTOR, "div.w7Dbne"):
+                try:
+                    name_nodes = card.find_elements(By.CSS_SELECTOR, ".dbg0pd .OSrXXb")
+                    name = name_nodes[0].text.strip() if name_nodes else ""
+                    if not name or name.lower() in known_names:
+                        continue
+                    text = card.text
+                    phones = self.extract_phone_numbers(text)
+                    websites.append({"name": name, "url": "", "phones": phones})
+                    known_names.add(name.lower())
+                except Exception:
+                    continue
 
             return websites
 
@@ -960,6 +1002,16 @@ class Automation:
 
             return []
 
+    def extract_phone_numbers(self, text):
+        matches = re.findall(
+            r"(?<!\d)(?:\+?\d{1,3}[\s.-]?)?(?:\(?\d{2,4}\)?[\s.-]?)?\d{3,4}[\s.-]?\d{3,4}(?!\d)",
+            text or ""
+        )
+        return list(dict.fromkeys(
+            value.strip() for value in matches
+            if len(re.sub(r"\D", "", value)) >= 7
+        ))
+
 
     # =========================================================
     # PROCESS ONE WEBSITE
@@ -986,8 +1038,29 @@ class Automation:
             "website": url,
             "contact_page": "",
             "emails": [],
-            "phones": []
+            "phones": website.get("phones", []),
+            "proposal": "",
+            "form_prefilled": False,
+            "status": "processing"
         }
+
+        business_key = self.business_key(website)
+        if self.was_previously_processed(business_key):
+            self._log(f"Skipping previously processed business: {name or url}")
+            result["status"] = "skipped_duplicate"
+            return result
+
+        if not url:
+            self._log(f"No website listed for {name}; creating a website-service draft.")
+            try:
+                result["proposal"] = self.generate_website_proposal(website)
+                result["status"] = "draft_ready"
+                self.save_outreach(business_key, result)
+                self.append_draft(result)
+            except Exception as exc:
+                result["status"] = "draft_error"
+                self._log(f"Draft generation error: {exc}")
+            return result
 
         # Open website in new tab
         tab_info = self.open_website(
@@ -1152,9 +1225,15 @@ class Automation:
                     self._log("Proposal generated:")
                     self._log(proposal)
 
-                    contact_name = os.environ.get("CONTACT_US_NAME", "").strip()
-                    contact_email = os.environ.get("CONTACT_US_EMAIL", "").strip()
-                    contact_phone = os.environ.get("CONTACT_US_PHONE", "").strip()
+                    contact_name = os.environ.get(
+                        "CONTACT_US_NAME", self.config.get("contact_name", "")
+                    ).strip()
+                    contact_email = os.environ.get(
+                        "CONTACT_US_EMAIL", self.config.get("contact_email", "")
+                    ).strip()
+                    contact_phone = os.environ.get(
+                        "CONTACT_US_PHONE", self.config.get("contact_phone", "")
+                    ).strip()
 
                     self._log(
                         f"Contact name configured: {bool(contact_name)}"
@@ -1181,10 +1260,8 @@ class Automation:
                             "Contact form filled successfully."
                         )
 
-                        self._log(
-                            "Waiting for confirmation before submission."
-                        )
-                        input("waiting click")
+                        result["form_prefilled"] = True
+                        self._log("Review mode: form prefilled but not submitted.")
 
                     result["proposal"] = proposal
 
@@ -1194,17 +1271,12 @@ class Automation:
                         "Could not generate proposal."
                     )
 
-                input("FDSAFDS")
-
             except Exception as e:
 
                 self._log(
                     f"Proposal generation error: {e}"
                 )
 
-
-            input("FDSAFDS")
-            
             # -----------------------------------------
             # FINAL RESULT
             # -----------------------------------------
@@ -1217,15 +1289,15 @@ class Automation:
                 self._log(
                     "✓ Contact information found"
                 )
-                input("FDSAFDS")
-
-
             else:
 
                 self._log(
                     "✗ No contact information found"
                 )
 
+            result["status"] = "draft_ready"
+            self.save_outreach(business_key, result)
+            self.append_draft(result)
             return result
 
         except Exception as e:
@@ -1245,13 +1317,19 @@ class Automation:
             try:
 
                 # Make sure website tab is active
-                if current_window in self.driver.window_handles:
+                keep_open = (
+                    result.get("form_prefilled", False)
+                    and bool(self.config.get("keep_prefilled_tabs_open", True))
+                )
+                if current_window in self.driver.window_handles and not keep_open:
 
                     self.driver.switch_to.window(
                         current_window
                     )
 
                     self.driver.close()
+                elif keep_open:
+                    self._log("Kept the prefilled contact-form tab open for review.")
 
             except Exception as e:
 
@@ -1345,9 +1423,7 @@ class Automation:
                     website
                 )
                 self._log(result)
-                # results.append(
-                #     result
-                # )
+                results.append(result)
 
             except Exception as e:
 
@@ -1513,13 +1589,8 @@ class Automation:
                 # ----------------------------------------------------
 
                 response = client.responses.create(
-                    model="gpt-5.5",
-                    input=content,
-                    text={
-                        "format": {
-                            "type": "json_object"
-                        }
-                    }
+                    model=self.config.get("openai_model", "gpt-5.5"),
+                    input=content
                 )
 
                 response = response.output_text
@@ -1562,16 +1633,6 @@ class Automation:
                 # ----------------------------------------------------
                 # Convert JSON response into Python object
                 # ----------------------------------------------------
-
-                try:
-                    analysis = json.loads(response)
-
-                except json.JSONDecodeError as e:
-                    print("JSON parsing failed")
-                    print("Error:", e)
-                    print("Raw response:")
-                    print(repr(response))
-                    raise
 
                 # ----------------------------------------------------
                 # IMAGE GENERATION
@@ -1865,6 +1926,11 @@ class Automation:
 
         company_name = website.get("name", "")
         website_url = website.get("url", "")
+        business_context = self.search_query
+        our_company = self.config.get("company_name", "our web development company")
+        our_email = self.config.get("contact_email", "")
+        our_phone = self.config.get("contact_phone", "")
+        our_website = self.config.get("company_website", "")
 
         prompt = f"""
     You are helping a professional website development company
@@ -1875,6 +1941,14 @@ class Automation:
 
     Website:
     {website_url}
+
+    Search/category context:
+    {business_context}
+
+    Sender company: {our_company}
+    Sender email: {our_email}
+    Sender phone: {our_phone}
+    Sender website: {our_website}
 
     Our company provides:
 
@@ -1909,7 +1983,7 @@ class Automation:
     - Invite them to contact us if they are interested.
     - Mention that we can discuss their requirements and provide
     suitable recommendations.
-    - Do not include a fake phone number, email address or website.
+    - Include only the sender contact details supplied above; omit empty ones.
     - Do not include a subject line unless specifically requested.
 
     Return ONLY the proposal text.
@@ -1921,6 +1995,70 @@ class Automation:
             filename="proposal"
         )
 
+
+    def business_key(self, website):
+        """Return a stable domain/name key for deduplication."""
+        url = website.get("url", "").strip().lower()
+        name = website.get("name", "").strip().lower()
+        parsed = urlparse(url) if url else None
+        value = (parsed.netloc.removeprefix("www.") if parsed else "") or name
+        return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+    def was_previously_processed(self, business_key):
+        row = self.db.execute(
+            "SELECT status FROM outreach WHERE business_key = ?", (business_key,)
+        ).fetchone()
+        return bool(row and row[0] in {"draft_ready", "sent", "submitted"})
+
+    def save_outreach(self, business_key, result):
+        self.db.execute(
+            '''INSERT INTO outreach (
+                business_key, business_name, website, contact_page, emails,
+                phones, proposal, form_prefilled, status, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(business_key) DO UPDATE SET
+                business_name=excluded.business_name, website=excluded.website,
+                contact_page=excluded.contact_page, emails=excluded.emails,
+                phones=excluded.phones, proposal=excluded.proposal,
+                form_prefilled=excluded.form_prefilled, status=excluded.status,
+                updated_at=excluded.updated_at''',
+            (
+                business_key, result.get("name", ""), result.get("website", ""),
+                result.get("contact_page", ""), json.dumps(result.get("emails", [])),
+                json.dumps(result.get("phones", [])), result.get("proposal", ""),
+                int(result.get("form_prefilled", False)), result.get("status", "draft_ready"),
+                datetime.now().isoformat(timespec="seconds")
+            )
+        )
+        self.db.commit()
+
+    def append_draft(self, result):
+        """Export drafts for human review; no email, form, or WhatsApp is sent."""
+        path = self.data_dir / "outreach_drafts.csv"
+        exists = path.exists()
+        message = result.get("proposal", "")
+        phone = (result.get("phones") or [""])[0]
+        digits = re.sub(r"\D", "", phone)
+        whatsapp_url = ""
+        if digits and message:
+            whatsapp_url = f"https://wa.me/{digits}?text={quote_plus(message)}"
+        fields = ["business_name", "website", "contact_page", "emails", "phones",
+                  "proposal", "form_prefilled", "whatsapp_review_url", "status"]
+        with path.open("a", newline="", encoding="utf-8-sig") as handle:
+            writer = csv.DictWriter(handle, fieldnames=fields)
+            if not exists:
+                writer.writeheader()
+            writer.writerow({
+                "business_name": result.get("name", ""),
+                "website": result.get("website", ""),
+                "contact_page": result.get("contact_page", ""),
+                "emails": "; ".join(result.get("emails", [])),
+                "phones": "; ".join(result.get("phones", [])),
+                "proposal": message,
+                "form_prefilled": result.get("form_prefilled", False),
+                "whatsapp_review_url": whatsapp_url,
+                "status": result.get("status", "draft_ready")
+            })
 
     def normalize_text(self, text):
         """

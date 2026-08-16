@@ -1,0 +1,14 @@
+{
+    "headless": false,
+    "search_query": "salons near me",
+    "limit": 10,
+    "openai_model": "gpt-5.5",
+    "data_dir": "data",
+    "review_mode": true,
+    "keep_prefilled_tabs_open": true,
+    "company_name": "Wensite Company Name",
+    "company_website": "https://example.com",
+    "contact_name": "Your Name",
+    "contact_email": "you@example.com",
+    "contact_phone": "+971500000000"
+}

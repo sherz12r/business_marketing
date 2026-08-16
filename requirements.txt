@@ -6,3 +6,4 @@ undetected_chromedriver==3.5.5
 PyInstaller
 openai
 python-dotenv
+playwright
