@@ -4,13 +4,15 @@ from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import NoSuchElementException
 from selenium.common.exceptions import TimeoutException
 from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.common.keys import Keys
 from datetime import datetime, date, timedelta
 from selenium.webdriver.common.by import By
 import undetected_chromedriver as uc
 from tkinter import messagebox
-from email.mime import text
+from email.message import EmailMessage
 from random import uniform
 from time import sleep
+import smtplib
 import tkinter as tk
 import sys
 import os, json, sys
@@ -25,6 +27,14 @@ from urllib.parse import quote_plus
 from urllib.parse import urljoin, urlparse
 from playwright.sync_api import sync_playwright
 from dotenv import load_dotenv
+from progress_tracker import (
+    EVENT_EMAIL_SENT,
+    EVENT_FORM_PREFILLED,
+    EVENT_WEBSITE_OPENED,
+    EVENT_WHATSAPP_SENT,
+    ensure_progress_schema,
+    record_event,
+)
 
 
 
@@ -85,6 +95,7 @@ class Automation:
             contact_page TEXT, emails TEXT, phones TEXT, proposal TEXT,
             form_prefilled INTEGER DEFAULT 0, status TEXT, updated_at TEXT
         )''')
+        ensure_progress_schema(self.db)
         self.db.commit()
         browser_mode = "headless (no window)" if self.headless else "visible"
         self._log(f"Opening Chrome browser — {browser_mode}...")
@@ -915,10 +926,16 @@ class Automation:
 
             text = body.text
 
+            href_text = []
+            for link in page.find_elements(By.CSS_SELECTOR, "a[href]"):
+                href = link.get_attribute("href") or ""
+                if href.startswith("mailto:"):
+                    href_text.append(href)
+
             emails = sorted(
                 set(
                     email_regex.findall(
-                        text
+                        text + " " + " ".join(href_text)
                     )
                 )
             )
@@ -961,8 +978,18 @@ class Automation:
 
             text = body.text
 
+            href_text = []
+            for link in page.find_elements(By.CSS_SELECTOR, "a[href]"):
+                href = link.get_attribute("href") or ""
+                if (
+                    href.startswith("tel:")
+                    or "wa.me/" in href
+                    or "whatsapp.com/send" in href
+                ):
+                    href_text.append(href)
+
             numbers = phone_regex.findall(
-                text
+                text + " " + " ".join(href_text)
             )
 
             cleaned = []
@@ -1001,6 +1028,45 @@ class Automation:
             )
 
             return []
+
+    def find_whatsapp_numbers(self, page):
+        numbers = []
+
+        try:
+            links = page.find_elements(By.CSS_SELECTOR, "a[href]")
+
+            for link in links:
+                href = link.get_attribute("href") or ""
+                href_lower = href.lower()
+
+                if (
+                    "wa.me/" not in href_lower
+                    and "whatsapp.com/send" not in href_lower
+                    and "api.whatsapp.com/send" not in href_lower
+                ):
+                    continue
+
+                parsed = urlparse(href)
+                candidate = ""
+
+                if "wa.me" in parsed.netloc:
+                    candidate = parsed.path.strip("/")
+                else:
+                    match = re.search(r"(?:phone=)(\+?\d+)", href)
+                    if match:
+                        candidate = match.group(1)
+
+                digits = re.sub(r"\D", "", candidate)
+
+                if len(digits) >= 7 and candidate not in numbers:
+                    numbers.append(candidate)
+
+        except Exception as e:
+            self._log(
+                f"WhatsApp link extraction error: {e}"
+            )
+
+        return numbers
 
     def extract_phone_numbers(self, text):
         matches = re.findall(
@@ -1041,6 +1107,8 @@ class Automation:
             "phones": website.get("phones", []),
             "proposal": "",
             "form_prefilled": False,
+            "email_sent": False,
+            "whatsapp_sent": False,
             "status": "processing"
         }
 
@@ -1054,7 +1122,12 @@ class Automation:
             self._log(f"No website listed for {name}; creating a website-service draft.")
             try:
                 result["proposal"] = self.generate_website_proposal(website)
-                result["status"] = "draft_ready"
+                self.run_fallback_channels(
+                    result,
+                    business_key,
+                    reason="no website available"
+                )
+                self.update_result_status(result)
                 self.save_outreach(business_key, result)
                 self.append_draft(result)
             except Exception as exc:
@@ -1070,6 +1143,17 @@ class Automation:
         if not tab_info:
 
             return result
+
+        try:
+            record_event(
+                self.db,
+                EVENT_WEBSITE_OPENED,
+                business_key,
+                result,
+                details="Website tab opened by automation",
+            )
+        except Exception as exc:
+            self._log(f"Progress event error: {exc}")
 
         original_window = tab_info[
             "original_window"
@@ -1102,9 +1186,18 @@ class Automation:
                 self.driver
             )
 
+            whatsapp_numbers = self.find_whatsapp_numbers(
+                self.driver
+            )
+
             result["emails"] = emails
 
-            result["phones"] = phones
+            result["phones"] = sorted(
+                set(
+                    phones
+                    + whatsapp_numbers
+                )
+            )
 
             self._log(
                 f"Emails found: {emails}"
@@ -1174,6 +1267,12 @@ class Automation:
                         )
                     )
 
+                    contact_whatsapp_numbers = (
+                        self.find_whatsapp_numbers(
+                            self.driver
+                        )
+                    )
+
                     # Merge emails
                     result["emails"] = sorted(
                         set(
@@ -1187,6 +1286,7 @@ class Automation:
                         set(
                             result["phones"]
                             + contact_phones
+                            + contact_whatsapp_numbers
                         )
                     )
 
@@ -1224,15 +1324,19 @@ class Automation:
 
                     self._log("Proposal generated:")
                     self._log(proposal)
+                    result["proposal"] = proposal
 
-                    contact_name = os.environ.get(
-                        "CONTACT_US_NAME", self.config.get("contact_name", "")
+                    contact_name = self.get_config_or_env(
+                        "contact_name",
+                        "CONTACT_US_NAME"
                     ).strip()
-                    contact_email = os.environ.get(
-                        "CONTACT_US_EMAIL", self.config.get("contact_email", "")
+                    contact_email = self.get_config_or_env(
+                        "contact_email",
+                        "CONTACT_US_EMAIL"
                     ).strip()
-                    contact_phone = os.environ.get(
-                        "CONTACT_US_PHONE", self.config.get("contact_phone", "")
+                    contact_phone = self.get_config_or_env(
+                        "contact_phone",
+                        "CONTACT_US_PHONE"
                     ).strip()
 
                     self._log(
@@ -1261,9 +1365,25 @@ class Automation:
                         )
 
                         result["form_prefilled"] = True
+                        try:
+                            record_event(
+                                self.db,
+                                EVENT_FORM_PREFILLED,
+                                business_key,
+                                result,
+                                details="Contact form prefilled for review",
+                            )
+                        except Exception as exc:
+                            self._log(f"Progress event error: {exc}")
                         self._log("Review mode: form prefilled but not submitted.")
 
-                    result["proposal"] = proposal
+                    else:
+
+                        self.run_fallback_channels(
+                            result,
+                            business_key,
+                            reason="contact form not found or not fillable"
+                        )
 
                 else:
 
@@ -1295,7 +1415,7 @@ class Automation:
                     "✗ No contact information found"
                 )
 
-            result["status"] = "draft_ready"
+            self.update_result_status(result)
             self.save_outreach(business_key, result)
             self.append_draft(result)
             return result
@@ -1556,6 +1676,204 @@ class Automation:
             return None
 
 
+    def _find_chatgpt_editor(self, page):
+        selectors = [
+            "textarea#mobile-composer-prompt",
+            "textarea[data-mobile-composer-prompt]",
+            "textarea[name='prompt'][aria-label='Chat with ChatGPT']",
+            "form[action*='/unauth-mweb/conversation'] textarea[name='prompt']",
+            "textarea.wm-composer-textarea",
+            "textarea[data-testid='prompt-textarea']",
+            "#prompt-textarea",
+            "textarea[name='prompt']",
+            "[data-testid='composer-root'] [contenteditable='true']",
+            "div.ProseMirror[contenteditable='true']",
+            "[contenteditable='true'][role='textbox']",
+            "[contenteditable='true']",
+        ]
+
+        for selector in selectors:
+            editor = page.locator(selector).last
+            try:
+                editor.wait_for(state="visible", timeout=7000)
+                return editor
+            except Exception:
+                continue
+
+        raise Exception(
+            "ChatGPT prompt box was not found. Sign in in the opened "
+            "ChatGPT window, then run again, or set OPENAI_API_KEY in .env."
+        )
+
+    def _chatgpt_editor_has_text(self, editor):
+        try:
+            value = editor.input_value(timeout=1000)
+        except Exception:
+            try:
+                value = editor.inner_text(timeout=1000)
+            except Exception:
+                value = ""
+        return bool(str(value).strip())
+
+    def _set_chatgpt_editor_text(self, page, editor, content):
+        try:
+            editor.evaluate(
+                """(element, text) => {
+                    const proto = element instanceof HTMLTextAreaElement
+                        ? HTMLTextAreaElement.prototype
+                        : HTMLInputElement.prototype;
+                    const descriptor = Object.getOwnPropertyDescriptor(proto, 'value');
+                    if (descriptor && descriptor.set) {
+                        descriptor.set.call(element, text);
+                    } else {
+                        element.value = text;
+                    }
+                    element.dispatchEvent(new InputEvent('input', {
+                        bubbles: true,
+                        inputType: 'insertText',
+                        data: text
+                    }));
+                    element.dispatchEvent(new Event('change', { bubbles: true }));
+                    element.dispatchEvent(new KeyboardEvent('keyup', {
+                        bubbles: true,
+                        key: ' ',
+                        code: 'Space'
+                    }));
+                }""",
+                content
+            )
+            page.wait_for_timeout(800)
+            return self._chatgpt_editor_has_text(editor)
+        except Exception:
+            return False
+
+    def _paste_chatgpt_prompt(self, page, editor, content):
+        editor.click()
+        if self._set_chatgpt_editor_text(page, editor, content):
+            return
+
+        try:
+            page.evaluate(
+                "(text) => navigator.clipboard.writeText(text)",
+                content
+            )
+            page.keyboard.press("Control+V")
+            page.wait_for_timeout(1000)
+        except Exception:
+            pass
+
+        if self._chatgpt_editor_has_text(editor):
+            return
+
+        try:
+            editor.fill(content)
+            page.wait_for_timeout(1000)
+        except Exception:
+            editor.click()
+            page.keyboard.insert_text(content)
+            page.wait_for_timeout(1000)
+
+    def _send_chatgpt_prompt(self, page):
+        selectors = [
+            "button[data-composer-submit]",
+            "button.wm-composer-submitButton",
+            "form[action*='/unauth-mweb/conversation'] button[type='submit']",
+            "button[data-testid='send-button']",
+            "button[aria-label='Send prompt']",
+            "button[aria-label='Send message']",
+        ]
+
+        for selector in selectors:
+            button = page.locator(selector).last
+            try:
+                button.wait_for(state="visible", timeout=5000)
+                for _ in range(20):
+                    if button.is_enabled():
+                        button.click()
+                        return
+                    page.wait_for_timeout(250)
+            except Exception:
+                continue
+
+        try:
+            page.locator(
+                "form[action*='/unauth-mweb/conversation']"
+            ).evaluate(
+                "form => form.requestSubmit ? form.requestSubmit() : form.submit()"
+            )
+            return
+        except Exception:
+            pass
+
+        page.keyboard.press("Enter")
+
+    def _assistant_response_count(self, page):
+        try:
+            return page.locator('[data-message-author-role="assistant"]').count()
+        except Exception:
+            return 0
+
+    def _wait_for_chatgpt_generation(self, page):
+        stop_selector = "button[data-testid='stop-button'], button[aria-label*='Stop']"
+        try:
+            page.locator(stop_selector).first.wait_for(
+                state="hidden",
+                timeout=120000
+            )
+        except Exception:
+            pass
+        page.wait_for_timeout(1500)
+
+    def _read_chatgpt_response(self, page, previous_count):
+        assistant_selector = '[data-message-author-role="assistant"]'
+        try:
+            page.wait_for_function(
+                """(count) => document.querySelectorAll(
+                    '[data-message-author-role="assistant"]'
+                ).length > count""",
+                previous_count,
+                timeout=120000,
+            )
+        except Exception:
+            pass
+
+        self._wait_for_chatgpt_generation(page)
+
+        responses = page.locator(assistant_selector)
+        last_text = ""
+        stable_reads = 0
+
+        for _ in range(12):
+            try:
+                count = responses.count()
+                if count:
+                    text = responses.nth(count - 1).inner_text(timeout=5000).strip()
+                    if text and text == last_text:
+                        stable_reads += 1
+                    else:
+                        stable_reads = 0
+                    last_text = text
+                    if text and stable_reads >= 1:
+                        return text
+            except Exception:
+                pass
+            page.wait_for_timeout(1000)
+
+        if last_text:
+            return last_text
+
+        copy_selector = (
+            'button[aria-label="Copy response"], '
+            'button[aria-label="Copy"], '
+            'button[data-testid="copy-turn-action-button"]'
+        )
+        copy_button = page.locator(copy_selector).last
+        copy_button.wait_for(state="visible", timeout=30000)
+        copy_button.scroll_into_view_if_needed()
+        copy_button.click()
+        page.wait_for_timeout(1000)
+        return page.evaluate("navigator.clipboard.readText()")
+
     def ask_ai(self, content, domain, filename, Image=False):
 
         # ============================================================
@@ -1774,63 +2092,64 @@ class Automation:
 
         with sync_playwright() as p:
 
-            browser = p.chromium.launch(
-                headless=False
+            profile_dir = Path(
+                self.config.get("chatgpt_profile_dir", "chatgpt_profile")
             )
 
-            context = browser.new_context(
+            if not profile_dir.is_absolute():
+                profile_dir = self.data_dir / profile_dir
+
+            profile_dir.mkdir(parents=True, exist_ok=True)
+
+            context = p.chromium.launch_persistent_context(
+                user_data_dir=str(profile_dir),
+                headless=False,
                 permissions=[
                     "clipboard-read",
                     "clipboard-write"
-                ]
+                ],
+                viewport={
+                    "width": 1280,
+                    "height": 900
+                }
             )
 
-            page = context.new_page()
+            page = context.pages[0] if context.pages else context.new_page()
 
             page.goto(
-                "https://chat.openai.com"
+                "https://chatgpt.com/",
+                wait_until="domcontentloaded",
+                timeout=60000
             )
 
-            page.wait_for_timeout(5000)
+            try:
+                page.wait_for_load_state(
+                    "networkidle",
+                    timeout=30000
+                )
+            except Exception:
+                pass
 
-            editor = page.locator(
-                "[contenteditable='true']"
-            )
+            page.wait_for_timeout(3000)
 
-            editor.wait_for(
-                state="visible",
-                timeout=30000
-            )
+            try:
+                editor = self._find_chatgpt_editor(page)
+            except Exception:
+                self._log(
+                    "ChatGPT prompt box is not ready. If a sign-in page is "
+                    "showing, complete sign-in in the ChatGPT window."
+                )
+                page.wait_for_timeout(120000)
+                editor = self._find_chatgpt_editor(page)
 
-            # editor.fill(content)
-            editor.click()
+            previous_count = self._assistant_response_count(page)
 
-            page.keyboard.insert_text(content)
+            self._paste_chatgpt_prompt(page, editor, content)
+            self._send_chatgpt_prompt(page)
 
-            # time.sleep(3)
-            page.wait_for_timeout(5000)
-
-            page.keyboard.press("Enter")
-
-            page.wait_for_timeout(10000)
-
-            copy_button = page.locator(
-                'button[aria-label="Copy response"]'
-            ).last
-
-            copy_button.wait_for(
-                state="visible",
-                timeout=30000
-            )
-
-            copy_button.scroll_into_view_if_needed()
-
-            copy_button.click()
-
-            page.wait_for_timeout(1000)
-
-            response = page.evaluate(
-                "navigator.clipboard.readText()"
+            response = self._read_chatgpt_response(
+                page,
+                previous_count
             )
 
             self._log("writing ai response")
@@ -1912,7 +2231,7 @@ class Automation:
 
                 print("Saved:", filepath)
 
-            browser.close()
+            context.close()
 
             return response
 
@@ -1993,7 +2312,460 @@ class Automation:
             prompt,
             domain=company_name,
             filename="proposal"
+        ) 
+
+
+    def get_config_or_env(self, config_key, env_key, default=""):
+        value = self.config.get(config_key)
+
+        if value is not None and str(value).strip():
+            return str(value)
+
+        return os.environ.get(env_key, default)
+
+    def get_section_setting(self, section, key, default=None, env_key=None):
+        section_config = self.config.get(section, {})
+
+        if isinstance(section_config, dict):
+            value = section_config.get(key)
+            if value is not None and str(value).strip():
+                return value
+
+        flat_key = f"{section}_{key}"
+        value = self.config.get(flat_key)
+
+        if value is not None and str(value).strip():
+            return value
+
+        if env_key:
+            value = os.environ.get(env_key)
+            if value is not None and str(value).strip():
+                return value
+
+        return default
+
+    def get_bool_setting(self, section, key, default=False, env_key=None):
+        value = self.get_section_setting(
+            section,
+            key,
+            default=default,
+            env_key=env_key
         )
+
+        if isinstance(value, bool):
+            return value
+
+        if value is None:
+            return bool(default)
+
+        return str(value).strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on"
+        }
+
+    def normalize_whatsapp_phone(self, phone):
+        digits = re.sub(
+            r"\D",
+            "",
+            phone or ""
+        )
+
+        if not digits:
+            return ""
+
+        if digits.startswith("00"):
+            digits = digits[2:]
+
+        country_code = str(
+            self.get_section_setting(
+                "whatsapp",
+                "default_country_code",
+                default=self.config.get("default_country_code", "971")
+            )
+        ).strip()
+
+        if digits.startswith("0") and country_code:
+            digits = country_code + digits[1:]
+        elif len(digits) <= 9 and country_code:
+            digits = country_code + digits
+
+        return digits
+
+    def primary_whatsapp_phone(self, result):
+        for phone in result.get("phones", []):
+            digits = self.normalize_whatsapp_phone(
+                phone
+            )
+
+            if len(digits) >= 10:
+                return digits
+
+        return ""
+
+    def run_fallback_channels(self, result, business_key, reason=""):
+        self._log(
+            f"Fallback outreach check started: {reason}"
+        )
+
+        whatsapp_sent = self.send_whatsapp_message(
+            result,
+            business_key
+        )
+
+        email_sent = self.send_email_message(
+            result,
+            business_key
+        )
+
+        return whatsapp_sent or email_sent
+
+    def update_result_status(self, result):
+        if result.get("email_sent") and result.get("whatsapp_sent"):
+            result["status"] = "fallback_sent"
+        elif result.get("email_sent"):
+            result["status"] = "email_sent"
+        elif result.get("whatsapp_sent"):
+            result["status"] = "whatsapp_sent"
+        else:
+            result["status"] = "draft_ready"
+
+    def send_whatsapp_message(self, result, business_key):
+        if not self.get_bool_setting(
+            "whatsapp",
+            "enabled",
+            default=True
+        ):
+            self._log("WhatsApp fallback disabled.")
+            return False
+
+        message = (
+            result.get("proposal", "")
+            or ""
+        ).strip()
+
+        phone = self.primary_whatsapp_phone(
+            result
+        )
+
+        if not phone:
+            self._log("WhatsApp fallback skipped: no usable phone number.")
+            return False
+
+        if not message:
+            self._log("WhatsApp fallback skipped: proposal message is empty.")
+            return False
+
+        auto_send = self.get_bool_setting(
+            "whatsapp",
+            "auto_send",
+            default=False
+        )
+
+        open_for_review = self.get_bool_setting(
+            "whatsapp",
+            "open_for_review",
+            default=True
+        )
+
+        if not auto_send and not open_for_review:
+            self._log("WhatsApp fallback ready, but auto_send is off.")
+            return False
+
+        url = (
+            f"https://web.whatsapp.com/send?"
+            f"phone={phone}&text={quote_plus(message)}"
+        )
+
+        original_window = None
+        whatsapp_window = None
+
+        try:
+            original_window = self.driver.current_window_handle
+            self.driver.switch_to.new_window("tab")
+            whatsapp_window = self.driver.current_window_handle
+            self.driver.get(url)
+
+            WebDriverWait(
+                self.driver,
+                45
+            ).until(
+                EC.presence_of_element_located(
+                    (By.TAG_NAME, "body")
+                )
+            )
+
+            self._log(
+                f"WhatsApp opened for {phone}."
+            )
+
+            if not auto_send:
+                self._log(
+                    "WhatsApp auto_send is off; message left open for review."
+                )
+                return False
+
+            send_button = self.find_whatsapp_send_button()
+
+            if not send_button:
+                self._log(
+                    "WhatsApp send button not found. Log in to WhatsApp Web "
+                    "or review the opened tab."
+                )
+                return False
+
+            send_button.click()
+            self.random_sleep()
+            result["whatsapp_sent"] = True
+            record_event(
+                self.db,
+                EVENT_WHATSAPP_SENT,
+                business_key,
+                result,
+                details="WhatsApp message sent by fallback"
+            )
+            self._log("WhatsApp message sent.")
+            return True
+
+        except Exception as e:
+            self._log(
+                f"WhatsApp fallback error: {e}"
+            )
+            return False
+
+        finally:
+            keep_tab_open = self.get_bool_setting(
+                "whatsapp",
+                "keep_tabs_open",
+                default=not auto_send
+            )
+
+            try:
+                if (
+                    whatsapp_window
+                    and whatsapp_window in self.driver.window_handles
+                    and not keep_tab_open
+                ):
+                    self.driver.switch_to.window(
+                        whatsapp_window
+                    )
+                    self.driver.close()
+
+                if (
+                    original_window
+                    and original_window in self.driver.window_handles
+                ):
+                    self.driver.switch_to.window(
+                        original_window
+                    )
+
+            except Exception:
+                pass
+
+    def find_whatsapp_send_button(self):
+        selectors = [
+            (By.CSS_SELECTOR, "button[aria-label='Send']"),
+            (By.CSS_SELECTOR, "button[data-testid='compose-btn-send']"),
+            (By.XPATH, "//span[@data-icon='send']/ancestor::button[1]"),
+            (By.XPATH, "//*[@role='button' and .//span[@data-icon='send']]"),
+        ]
+
+        for by, selector in selectors:
+            try:
+                return WebDriverWait(
+                    self.driver,
+                    90
+                ).until(
+                    EC.element_to_be_clickable(
+                        (by, selector)
+                    )
+                )
+            except Exception:
+                continue
+
+        return None
+
+    def email_recipients(self, result):
+        emails = list(
+            dict.fromkeys(
+                email.strip()
+                for email in result.get("emails", [])
+                if email and "@" in email
+            )
+        )
+
+        if not self.get_bool_setting(
+            "email",
+            "send_to_all_found",
+            default=False
+        ):
+            return emails[:1]
+
+        return emails
+
+    def send_email_message(self, result, business_key):
+        if not self.get_bool_setting(
+            "email",
+            "enabled",
+            default=True
+        ):
+            self._log("Email fallback disabled.")
+            return False
+
+        auto_send = self.get_bool_setting(
+            "email",
+            "auto_send",
+            default=False
+        )
+
+        recipients = self.email_recipients(
+            result
+        )
+
+        if not recipients:
+            self._log("Email fallback skipped: no email address found.")
+            return False
+
+        message = (
+            result.get("proposal", "")
+            or ""
+        ).strip()
+
+        if not message:
+            self._log("Email fallback skipped: proposal message is empty.")
+            return False
+
+        if not auto_send:
+            self._log(
+                "Email fallback ready, but auto_send is off."
+            )
+            return False
+
+        smtp_host = self.get_section_setting(
+            "email",
+            "smtp_host",
+            default="",
+            env_key="SMTP_HOST"
+        )
+        smtp_port = int(
+            self.get_section_setting(
+                "email",
+                "smtp_port",
+                default=587,
+                env_key="SMTP_PORT"
+            )
+        )
+        smtp_username = self.get_section_setting(
+            "email",
+            "smtp_username",
+            default="",
+            env_key="SMTP_USERNAME"
+        )
+        smtp_password = self.get_section_setting(
+            "email",
+            "smtp_password",
+            default="",
+            env_key="SMTP_PASSWORD"
+        )
+        from_email = self.get_section_setting(
+            "email",
+            "from_email",
+            default=self.config.get("contact_email", ""),
+            env_key="SMTP_FROM_EMAIL"
+        )
+        from_name = self.get_section_setting(
+            "email",
+            "from_name",
+            default=self.config.get("company_name", ""),
+            env_key="SMTP_FROM_NAME"
+        )
+        subject = self.get_section_setting(
+            "email",
+            "subject",
+            default="Website development proposal"
+        )
+
+        if not smtp_host or not from_email:
+            self._log(
+                "Email fallback skipped: smtp_host and from_email are required."
+            )
+            return False
+
+        email = EmailMessage()
+        email["Subject"] = str(subject)
+        email["From"] = (
+            f"{from_name} <{from_email}>"
+            if from_name
+            else str(from_email)
+        )
+        email["To"] = ", ".join(
+            recipients
+        )
+        email.set_content(
+            message
+        )
+
+        use_ssl = self.get_bool_setting(
+            "email",
+            "use_ssl",
+            default=False
+        )
+        use_tls = self.get_bool_setting(
+            "email",
+            "use_tls",
+            default=True
+        )
+
+        try:
+            if use_ssl:
+                server = smtplib.SMTP_SSL(
+                    smtp_host,
+                    smtp_port,
+                    timeout=45
+                )
+            else:
+                server = smtplib.SMTP(
+                    smtp_host,
+                    smtp_port,
+                    timeout=45
+                )
+
+            with server:
+                server.ehlo()
+
+                if use_tls and not use_ssl:
+                    server.starttls()
+                    server.ehlo()
+
+                if smtp_username:
+                    server.login(
+                        smtp_username,
+                        smtp_password
+                    )
+
+                server.send_message(
+                    email
+                )
+
+            result["email_sent"] = True
+            record_event(
+                self.db,
+                EVENT_EMAIL_SENT,
+                business_key,
+                result,
+                details=f"Email sent to {', '.join(recipients)}"
+            )
+            self._log(
+                f"Email sent to {', '.join(recipients)}."
+            )
+            return True
+
+        except Exception as e:
+            self._log(
+                f"Email fallback error: {e}"
+            )
+            return False
 
 
     def business_key(self, website):
@@ -2005,10 +2777,22 @@ class Automation:
         return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
     def was_previously_processed(self, business_key):
+        if not bool(
+            self.config.get("skip_previously_processed", True)
+        ):
+            return False
+
         row = self.db.execute(
             "SELECT status FROM outreach WHERE business_key = ?", (business_key,)
         ).fetchone()
-        return bool(row and row[0] in {"draft_ready", "sent", "submitted"})
+        return bool(row and row[0] in {
+            "draft_ready",
+            "sent",
+            "submitted",
+            "email_sent",
+            "whatsapp_sent",
+            "fallback_sent"
+        })
 
     def save_outreach(self, business_key, result):
         self.db.execute(
@@ -2033,7 +2817,7 @@ class Automation:
         self.db.commit()
 
     def append_draft(self, result):
-        """Export drafts for human review; no email, form, or WhatsApp is sent."""
+        """Export each prepared outreach item and its send/review state."""
         path = self.data_dir / "outreach_drafts.csv"
         exists = path.exists()
         message = result.get("proposal", "")
@@ -2043,7 +2827,8 @@ class Automation:
         if digits and message:
             whatsapp_url = f"https://wa.me/{digits}?text={quote_plus(message)}"
         fields = ["business_name", "website", "contact_page", "emails", "phones",
-                  "proposal", "form_prefilled", "whatsapp_review_url", "status"]
+                  "proposal", "form_prefilled", "whatsapp_sent", "email_sent",
+                  "whatsapp_review_url", "status"]
         with path.open("a", newline="", encoding="utf-8-sig") as handle:
             writer = csv.DictWriter(handle, fieldnames=fields)
             if not exists:
@@ -2056,6 +2841,8 @@ class Automation:
                 "phones": "; ".join(result.get("phones", [])),
                 "proposal": message,
                 "form_prefilled": result.get("form_prefilled", False),
+                "whatsapp_sent": result.get("whatsapp_sent", False),
+                "email_sent": result.get("email_sent", False),
                 "whatsapp_review_url": whatsapp_url,
                 "status": result.get("status", "draft_ready")
             })
@@ -2202,8 +2989,15 @@ class Automation:
             )
 
             if not forms:
-                self._log("No forms found on page.")
-                return None
+                self._log("No form tags found; scanning page fields.")
+                try:
+                    body = self.driver.find_element(
+                        By.TAG_NAME,
+                        "body"
+                    )
+                    forms = [body]
+                except Exception:
+                    return None
 
             # First try to find a form that looks like a contact form
             for form in forms:
@@ -2214,7 +3008,7 @@ class Automation:
                     # Check inputs inside this form
                     inputs = form.find_elements(
                         By.CSS_SELECTOR,
-                        "input, textarea, select"
+                        "input, textarea, select, [contenteditable='true']"
                     )
 
                     field_names = []
@@ -2297,13 +3091,78 @@ class Automation:
 
                     email_fields = form.find_elements(
                         By.CSS_SELECTOR,
-                        "input[type='email']"
+                        "input[type='email'], input[name*='email' i], "
+                        "input[id*='email' i], input[placeholder*='email' i]"
                     )
 
                     if email_fields:
 
                         self._log(
                             "Form with email field found."
+                        )
+
+                        return form
+
+                except Exception:
+                    continue
+
+            for form in forms:
+
+                try:
+
+                    message_fields = form.find_elements(
+                        By.CSS_SELECTOR,
+                        "textarea, [contenteditable='true'], "
+                        "input[name*='message' i], input[id*='message' i], "
+                        "input[placeholder*='message' i], "
+                        "input[name*='comment' i], input[id*='comment' i], "
+                        "input[placeholder*='comment' i]"
+                    )
+
+                    if message_fields:
+
+                        self._log(
+                            "Form with message field found."
+                        )
+
+                        return form
+
+                except Exception:
+                    continue
+
+            for form in forms:
+
+                try:
+
+                    fields = form.find_elements(
+                        By.CSS_SELECTOR,
+                        "input, textarea, select, [contenteditable='true']"
+                    )
+
+                    visible_fields = []
+
+                    for field in fields:
+
+                        field_type = (
+                            field.get_attribute("type")
+                            or ""
+                        ).lower()
+
+                        if field_type == "hidden":
+                            continue
+
+                        try:
+                            if not field.is_displayed():
+                                continue
+                        except Exception:
+                            pass
+
+                        visible_fields.append(field)
+
+                    if len(visible_fields) >= 2:
+
+                        self._log(
+                            "Generic form fields found."
                         )
 
                         return form
@@ -2354,7 +3213,7 @@ class Automation:
 
             fields = form.find_elements(
                 By.CSS_SELECTOR,
-                "input, textarea, select"
+                "input, textarea, select, [contenteditable='true']"
             )
 
             if not fields:
@@ -2484,7 +3343,10 @@ class Automation:
                         field_id,
                         placeholder,
                         aria_label,
-                        label_text
+                        label_text,
+                        field.get_attribute("class") or "",
+                        field.get_attribute("title") or "",
+                        self.get_element_information(field)
                     ]
 
                     combined = " ".join(
@@ -2533,8 +3395,38 @@ class Automation:
 
                         elif field_type == "textarea":
 
-                            if field.tag_name.lower() != "textarea":
-                                continue
+                            tag_name = field.tag_name.lower()
+                            is_contenteditable = (
+                                field.get_attribute("contenteditable")
+                                or ""
+                            ).lower() == "true"
+
+                            if (
+                                tag_name != "textarea"
+                                and not is_contenteditable
+                            ):
+                                message_like_input = (
+                                    tag_name == "input"
+                                    and field_type_value in [
+                                        "",
+                                        "text",
+                                        "search"
+                                    ]
+                                    and any(
+                                        x in combined
+                                        for x in [
+                                            "message",
+                                            "comment",
+                                            "enquiry",
+                                            "inquiry",
+                                            "description",
+                                            "details"
+                                        ]
+                                    )
+                                )
+
+                                if not message_like_input:
+                                    continue
 
                     # ---------------------------------
                     # Keyword matching
@@ -2565,6 +3457,52 @@ class Automation:
             )
 
             return None
+
+    def fill_field_value(self, field, value):
+        """
+        Fill normal inputs, textareas, selects, and contenteditable fields.
+        """
+
+        value = value or ""
+
+        try:
+            tag_name = field.tag_name.lower()
+            is_contenteditable = (
+                field.get_attribute("contenteditable")
+                or ""
+            ).lower() == "true"
+
+            field.click()
+
+            if is_contenteditable:
+                try:
+                    self.driver.execute_script(
+                        "arguments[0].innerText = '';"
+                        "arguments[0].dispatchEvent(new Event('input', {bubbles:true}));",
+                        field
+                    )
+                except Exception:
+                    field.send_keys(Keys.CONTROL, "a")
+                    field.send_keys(Keys.BACKSPACE)
+
+                field.send_keys(value)
+                return True
+
+            if tag_name != "select":
+                try:
+                    field.clear()
+                except Exception:
+                    field.send_keys(Keys.CONTROL, "a")
+                    field.send_keys(Keys.BACKSPACE)
+
+            field.send_keys(value)
+            return True
+
+        except Exception as e:
+            self._log(
+                f"Field fill error: {e}"
+            )
+            return False
 
 
     def fill_contact_form(
@@ -2629,17 +3567,16 @@ class Automation:
 
             if name_field:
 
-                name_field.clear()
-
-                name_field.send_keys(
+                if self.fill_field_value(
+                    name_field,
                     name
-                )
+                ):
 
-                filled_count += 1
+                    filled_count += 1
 
-                self._log(
-                    "Name field filled."
-                )
+                    self._log(
+                        "Name field filled."
+                    )
 
             else:
 
@@ -2674,17 +3611,16 @@ class Automation:
 
             if email_field:
 
-                email_field.clear()
-
-                email_field.send_keys(
+                if self.fill_field_value(
+                    email_field,
                     email
-                )
+                ):
 
-                filled_count += 1
+                    filled_count += 1
 
-                self._log(
-                    "Email field filled."
-                )
+                    self._log(
+                        "Email field filled."
+                    )
 
             else:
 
@@ -2721,17 +3657,16 @@ class Automation:
 
             if phone_field:
 
-                phone_field.clear()
-
-                phone_field.send_keys(
+                if self.fill_field_value(
+                    phone_field,
                     phone
-                )
+                ):
 
-                filled_count += 1
+                    filled_count += 1
 
-                self._log(
-                    "Phone field filled."
-                )
+                    self._log(
+                        "Phone field filled."
+                    )
 
             else:
 
@@ -2764,17 +3699,16 @@ class Automation:
 
             if subject_field:
 
-                subject_field.clear()
-
-                subject_field.send_keys(
+                if self.fill_field_value(
+                    subject_field,
                     subject
-                )
+                ):
 
-                filled_count += 1
+                    filled_count += 1
 
-                self._log(
-                    "Subject field filled."
-                )
+                    self._log(
+                        "Subject field filled."
+                    )
 
             else:
 
@@ -2813,17 +3747,16 @@ class Automation:
 
             if message_field:
 
-                message_field.clear()
-
-                message_field.send_keys(
+                if self.fill_field_value(
+                    message_field,
                     message
-                )
+                ):
 
-                filled_count += 1
+                    filled_count += 1
 
-                self._log(
-                    "Message field filled."
-                )
+                    self._log(
+                        "Message field filled."
+                    )
 
             else:
 
