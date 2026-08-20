@@ -99,11 +99,26 @@ class Automation:
         self.db.commit()
         browser_mode = "headless (no window)" if self.headless else "visible"
         self._log(f"Opening Chrome browser — {browser_mode}...")
+        from app_paths import get_app_dir
+        configured_profile = Path(
+            self.config.get("chrome_profile_dir", "chrome_profile")
+        ).expanduser()
+        if not configured_profile.is_absolute():
+            configured_profile = Path(get_app_dir()) / configured_profile
+        configured_profile.mkdir(parents=True, exist_ok=True)
+        self.chrome_profile_dir = str(configured_profile.resolve())
+        self._log(f"Using persistent Chrome profile: {self.chrome_profile_dir}")
         try:
-            self.driver = self.get_driver(headless=self.headless)
+            self.driver = self.get_driver(
+                profile_dir=self.chrome_profile_dir,
+                headless=self.headless
+            )
         except Exception as e:
             self._log(f"Error connecting Chromium: {e}")
-            self.driver = self.get_driver_default(headless=self.headless)
+            self.driver = self.get_driver_default(
+                profile_dir=self.chrome_profile_dir,
+                headless=self.headless
+            )
 
         self._log("Browser ready.")
         self.iframe_found = False
@@ -442,6 +457,10 @@ class Automation:
                     ):
                         continue
 
+                    if self.is_ignored_url(website_url):
+                        self._log(f"Ignoring configured URL: {website_url}")
+                        continue
+
                     # Parse domain
                     parsed = urlparse(website_url)
 
@@ -537,6 +556,10 @@ class Automation:
                         if not href.startswith(
                             ("http://", "https://")
                         ):
+                            continue
+
+                        if self.is_ignored_url(href):
+                            self._log(f"Ignoring configured URL: {href}")
                             continue
 
                         parsed = urlparse(href)
@@ -1112,6 +1135,11 @@ class Automation:
             "status": "processing"
         }
 
+        if url and self.is_ignored_url(url):
+            self._log(f"Skipping configured ignored URL: {url}")
+            result["status"] = "ignored_url"
+            return result
+
         business_key = self.business_key(website)
         if self.was_previously_processed(business_key):
             self._log(f"Skipping previously processed business: {name or url}")
@@ -1377,13 +1405,15 @@ class Automation:
                             self._log(f"Progress event error: {exc}")
                         self._log("Review mode: form prefilled but not submitted.")
 
-                    else:
-
-                        self.run_fallback_channels(
-                            result,
-                            business_key,
-                            reason="contact form not found or not fillable"
-                        )
+                    # WhatsApp and email are required outreach channels, not
+                    # merely fallbacks for websites without a contact form.
+                    # Attempt both after preparing the proposal regardless of
+                    # whether a form was also filled successfully.
+                    self.run_fallback_channels(
+                        result,
+                        business_key,
+                        reason="proposal ready"
+                    )
 
                 else:
 
@@ -2399,6 +2429,29 @@ class Automation:
                 phone
             )
 
+            ignored_prefixes = self.get_section_setting(
+                "whatsapp",
+                "ignore_phone_prefixes",
+                default=[]
+            )
+            if isinstance(ignored_prefixes, str):
+                ignored_prefixes = [ignored_prefixes]
+
+            normalized_prefixes = [
+                re.sub(r"\D", "", str(prefix))
+                for prefix in ignored_prefixes
+                if str(prefix).strip()
+            ]
+            if any(
+                digits.startswith(prefix)
+                for prefix in normalized_prefixes
+                if prefix
+            ):
+                self._log(
+                    f"Skipping WhatsApp for ignored landline number: {phone}"
+                )
+                continue
+
             if len(digits) >= 10:
                 return digits
 
@@ -2480,6 +2533,17 @@ class Automation:
 
         original_window = None
         whatsapp_window = None
+        send_timeout = max(
+            5,
+            min(
+                10,
+                int(self.get_section_setting(
+                    "whatsapp",
+                    "send_timeout_seconds",
+                    default=10
+                ))
+            )
+        )
 
         try:
             original_window = self.driver.current_window_handle
@@ -2489,7 +2553,7 @@ class Automation:
 
             WebDriverWait(
                 self.driver,
-                45
+                send_timeout
             ).until(
                 EC.presence_of_element_located(
                     (By.TAG_NAME, "body")
@@ -2506,7 +2570,9 @@ class Automation:
                 )
                 return False
 
-            send_button = self.find_whatsapp_send_button()
+            send_button = self.find_whatsapp_send_button(
+                timeout=send_timeout
+            )
 
             if not send_button:
                 self._log(
@@ -2563,7 +2629,7 @@ class Automation:
             except Exception:
                 pass
 
-    def find_whatsapp_send_button(self):
+    def find_whatsapp_send_button(self, timeout=10):
         selectors = [
             (By.CSS_SELECTOR, "button[aria-label='Send']"),
             (By.CSS_SELECTOR, "button[data-testid='compose-btn-send']"),
@@ -2571,20 +2637,24 @@ class Automation:
             (By.XPATH, "//*[@role='button' and .//span[@data-icon='send']]"),
         ]
 
-        for by, selector in selectors:
-            try:
-                return WebDriverWait(
-                    self.driver,
-                    90
-                ).until(
-                    EC.element_to_be_clickable(
-                        (by, selector)
-                    )
-                )
-            except Exception:
-                continue
+        def first_clickable(driver):
+            for by, selector in selectors:
+                try:
+                    for element in driver.find_elements(by, selector):
+                        if element.is_displayed() and element.is_enabled():
+                            return element
+                except Exception:
+                    continue
+            return False
 
-        return None
+        try:
+            return WebDriverWait(
+                self.driver,
+                timeout
+            ).until(first_clickable)
+        except TimeoutException:
+            return None
+
 
     def email_recipients(self, result):
         emails = list(
@@ -2768,6 +2838,44 @@ class Automation:
             return False
 
 
+    def is_ignored_url(self, url):
+        """Match a URL against configured domains, URLs, or URL fragments."""
+        candidate = (url or "").strip().lower()
+        if not candidate:
+            return False
+
+        parsed_candidate = urlparse(candidate)
+        candidate_host = parsed_candidate.netloc.removeprefix("www.")
+        candidate_path = parsed_candidate.path.rstrip("/")
+
+        ignored = self.config.get("ignore_urls", [])
+        if isinstance(ignored, str):
+            ignored = [ignored]
+
+        for value in ignored:
+            pattern = str(value or "").strip().lower().rstrip("/")
+            if not pattern:
+                continue
+
+            parsed_pattern = urlparse(
+                pattern if "://" in pattern else f"//{pattern}"
+            )
+            pattern_host = parsed_pattern.netloc.removeprefix("www.")
+            pattern_path = parsed_pattern.path.rstrip("/")
+
+            host_matches = (
+                candidate_host == pattern_host
+                or candidate_host.endswith(f".{pattern_host}")
+            )
+            if host_matches and (
+                not pattern_path
+                or candidate_path == pattern_path
+                or candidate_path.startswith(f"{pattern_path}/")
+            ):
+                return True
+
+        return False
+
     def business_key(self, website):
         """Return a stable domain/name key for deduplication."""
         url = website.get("url", "").strip().lower()
@@ -2785,14 +2893,9 @@ class Automation:
         row = self.db.execute(
             "SELECT status FROM outreach WHERE business_key = ?", (business_key,)
         ).fetchone()
-        return bool(row and row[0] in {
-            "draft_ready",
-            "sent",
-            "submitted",
-            "email_sent",
-            "whatsapp_sent",
-            "fallback_sent"
-        })
+        # A draft or a partial send is not complete. Retry it on the next run
+        # so that both WhatsApp and email get a chance to be delivered.
+        return bool(row and row[0] == "fallback_sent")
 
     def save_outreach(self, business_key, result):
         self.db.execute(
@@ -3647,6 +3750,9 @@ class Automation:
                     "telephone",
                     "mobile",
                     "tel",
+                    "contact-number",
+                    "contactnumber",
+                    "contact-phone",
                     "your-phone",
                     "your_phone",
                     "phone-number",
