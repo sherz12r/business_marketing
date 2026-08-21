@@ -46,6 +46,45 @@ COLORS = {
     "white": "#ffffff",
 }
 
+DEFAULT_PROPOSAL_PROMPT = """You are helping a professional website development company
+write a short business introduction for a potential client.
+
+Business name:
+{business_name}
+
+Website:
+{website_url}
+
+Search/category context:
+{business_context}
+
+Sender company:
+{company_name}
+
+Our company provides:
+
+{services}
+
+Write a professional and friendly proposal that can be used
+as a draft for a website contact form.
+
+IMPORTANT:
+
+- Do not pretend that we know the company's specific problems.
+- Do not make false claims about their current website.
+- Do not say that we noticed problems unless they are explicitly provided.
+- Keep it relatively short.
+- Sound human, professional and helpful.
+- Do not use excessive marketing language.
+- Do not use emojis.
+- Do not mention that AI wrote the message.
+- Invite them to contact us if they are interested.
+- Mention that we can discuss their requirements and provide suitable recommendations.
+- Do not include sender contact details such as contact name, email, phone, website, or a contact-us block.
+- Do not include a subject line unless specifically requested.
+
+Return ONLY the proposal text."""
+
 DEFAULT_CONFIG = {
     "headless": False,
     "chrome_profile_dir": "chrome_profile",
@@ -57,6 +96,7 @@ DEFAULT_CONFIG = {
     "review_mode": True,
     "keep_prefilled_tabs_open": True,
     "skip_previously_processed": True,
+    "proposal_prompt": DEFAULT_PROPOSAL_PROMPT,
     "ignore_urls": [],
     "company_name": "",
     "company_website": "",
@@ -108,6 +148,12 @@ SETTINGS_SECTIONS = [
             {"path": ("chrome_profile_dir",), "label": "Chrome Profile Folder", "type": "text"},
             {"path": ("chatgpt_profile_dir",), "label": "ChatGPT Profile Folder", "type": "text"},
             {"path": ("openai_model",), "label": "OpenAI Model", "type": "text"},
+        ],
+    ),
+    (
+        "AI Prompt",
+        [
+            {"path": ("proposal_prompt",), "label": "Proposal Prompt", "type": "textarea", "height": 24},
         ],
     ),
     (
@@ -372,7 +418,7 @@ class SettingsDialog(tk.Toplevel):
                 )
                 widget.grid(row=row, column=1, sticky="w", pady=(8, 8))
                 self.variables[path_key] = (field, variable)
-            elif field_type == "list":
+            elif field_type in {"list", "textarea"}:
                 text = tk.Text(
                     parent,
                     height=field.get("height", 6),
@@ -428,7 +474,7 @@ class SettingsDialog(tk.Toplevel):
         for path_key, (field, widget) in self.text_widgets.items():
             value = get_config_value(self.config_data, field["path"], [])
             widget.delete("1.0", "end")
-            if isinstance(value, list):
+            if field["type"] == "list" and isinstance(value, list):
                 widget.insert("1.0", "\n".join(str(item) for item in value))
             elif value:
                 widget.insert("1.0", str(value))
@@ -481,7 +527,10 @@ class SettingsDialog(tk.Toplevel):
 
         for path_key, (field, widget) in self.text_widgets.items():
             raw_text = widget.get("1.0", "end").strip()
-            value = parse_settings_list(raw_text)
+            if field["type"] == "list":
+                value = parse_settings_list(raw_text)
+            else:
+                value = raw_text
             set_config_value(new_config, field["path"], value)
 
         return new_config

@@ -50,6 +50,68 @@ except ImportError:
 load_dotenv()
 
 
+DEFAULT_PROPOSAL_PROMPT = """You are helping a professional website development company
+write a short business introduction for a potential client.
+
+Business name:
+{business_name}
+
+Website:
+{website_url}
+
+Search/category context:
+{business_context}
+
+Sender company:
+{company_name}
+
+Our company provides:
+
+{services}
+
+Write a professional and friendly proposal that can be used
+as a draft for a website contact form.
+
+IMPORTANT:
+
+- Do not pretend that we know the company's specific problems.
+- Do not make false claims about their current website.
+- Do not say that we noticed problems unless they are explicitly provided.
+- Keep it relatively short.
+- Sound human, professional and helpful.
+- Do not use excessive marketing language.
+- Do not use emojis.
+- Do not mention that AI wrote the message.
+- Invite them to contact us if they are interested.
+- Mention that we can discuss their requirements and provide suitable recommendations.
+- Do not include sender contact details such as contact name, email, phone, website, or a contact-us block.
+- Do not include a subject line unless specifically requested.
+
+Return ONLY the proposal text."""
+
+
+PROPOSAL_SERVICES = [
+    "Website Development",
+    "E-commerce / Online Stores",
+    "Website Redesign",
+    "Responsive Mobile-Friendly Websites",
+    "SEO & Digital Marketing",
+    "Logo Design",
+    "Business Email Setup",
+    "Accounting Software",
+    "POS Solutions",
+    "E-Invoicing Software",
+    "Website Maintenance & Support",
+    "Domain & Hosting Setup",
+    "Custom Business Software",
+]
+
+
+class SafePromptValues(dict):
+    def __missing__(self, key):
+        return "{" + str(key) + "}"
+
+
 class Automation:
     
     def write_log_header(self, title, width=70):
@@ -2287,63 +2349,40 @@ class Automation:
         website_url = website.get("url", "")
         business_context = self.search_query
         our_company = self.config.get("company_name", "our web development company")
+        prompt_template = str(
+            self.config.get("proposal_prompt", "")
+            or DEFAULT_PROPOSAL_PROMPT
+        ).strip()
+        prompt_values = SafePromptValues({
+            "business_name": company_name,
+            "website_url": website_url,
+            "business_context": business_context,
+            "search_query": business_context,
+            "company_name": our_company,
+            "services": "\n".join(f"- {service}" for service in PROPOSAL_SERVICES),
+        })
 
-        prompt = f"""
-    You are helping a professional website development company
-    write a short business introduction for a potential client.
+        try:
+            prompt = prompt_template.format_map(prompt_values)
+        except Exception as exc:
+            self._log(
+                f"Proposal prompt format error: {exc}; using default prompt."
+            )
+            prompt = DEFAULT_PROPOSAL_PROMPT.format_map(prompt_values)
 
-    Business name:
-    {company_name}
+        lower_prompt = prompt.lower()
+        final_rules = []
+        if "do not include sender contact details" not in lower_prompt:
+            final_rules.append(
+                "- Do not include sender contact details such as contact name, "
+                "email, phone, website, or a contact-us block. Those details "
+                "are added separately only for channels where they are enabled."
+            )
+        if "return only" not in lower_prompt:
+            final_rules.append("- Return ONLY the proposal text.")
 
-    Website:
-    {website_url}
-
-    Search/category context:
-    {business_context}
-
-    Sender company:
-    {our_company}
-
-    Our company provides:
-
-    - Website Development
-    - E-commerce / Online Stores
-    - Website Redesign
-    - Responsive Mobile-Friendly Websites
-    - SEO & Digital Marketing
-    - Logo Design
-    - Business Email Setup
-    - Accounting Software
-    - POS Solutions
-    - E-Invoicing Software
-    - Website Maintenance & Support
-    - Domain & Hosting Setup
-    - Custom Business Software
-
-    Write a professional and friendly proposal that can be used
-    as a draft for a website contact form.
-
-    IMPORTANT:
-
-    - Do not pretend that we know the company's specific problems.
-    - Do not make false claims about their current website.
-    - Do not say that we noticed problems unless they are explicitly
-    provided.
-    - Keep it relatively short.
-    - Sound human, professional and helpful.
-    - Do not use excessive marketing language.
-    - Do not use emojis.
-    - Do not mention that AI wrote the message.
-    - Invite them to contact us if they are interested.
-    - Mention that we can discuss their requirements and provide
-    suitable recommendations.
-    - Do not include sender contact details such as contact name,
-    email, phone, website, or a contact-us block. Those details are
-    added separately only for channels where they are enabled.
-    - Do not include a subject line unless specifically requested.
-
-    Return ONLY the proposal text.
-    """
+        if final_rules:
+            prompt = f"{prompt}\n\nFINAL RULES:\n" + "\n".join(final_rules)
 
         return self.ask_ai(
             prompt,
