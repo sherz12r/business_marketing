@@ -1379,11 +1379,21 @@ class Automation:
                         f"Contact phone configured: {bool(contact_phone)}"
                     )
 
+                    include_form_contact_details = self.get_bool_setting(
+                        "website_forms",
+                        "include_contact_details",
+                        default=True
+                    )
+                    form_message = self.channel_message(
+                        result,
+                        "website_forms"
+                    )
+
                     form_found = self.fill_contact_form(
-                        name=contact_name,
-                        email=contact_email,
-                        phone=contact_phone,
-                        message=proposal
+                        name=contact_name if include_form_contact_details else "",
+                        email=contact_email if include_form_contact_details else "",
+                        phone=contact_phone if include_form_contact_details else "",
+                        message=form_message
                     )
 
                     if form_found:
@@ -2277,9 +2287,6 @@ class Automation:
         website_url = website.get("url", "")
         business_context = self.search_query
         our_company = self.config.get("company_name", "our web development company")
-        our_email = self.config.get("contact_email", "")
-        our_phone = self.config.get("contact_phone", "")
-        our_website = self.config.get("company_website", "")
 
         prompt = f"""
     You are helping a professional website development company
@@ -2294,10 +2301,8 @@ class Automation:
     Search/category context:
     {business_context}
 
-    Sender company: {our_company}
-    Sender email: {our_email}
-    Sender phone: {our_phone}
-    Sender website: {our_website}
+    Sender company:
+    {our_company}
 
     Our company provides:
 
@@ -2332,7 +2337,9 @@ class Automation:
     - Invite them to contact us if they are interested.
     - Mention that we can discuss their requirements and provide
     suitable recommendations.
-    - Include only the sender contact details supplied above; omit empty ones.
+    - Do not include sender contact details such as contact name,
+    email, phone, website, or a contact-us block. Those details are
+    added separately only for channels where they are enabled.
     - Do not include a subject line unless specifically requested.
 
     Return ONLY the proposal text.
@@ -2343,6 +2350,68 @@ class Automation:
             domain=company_name,
             filename="proposal"
         ) 
+
+    def contact_details_block(self):
+        lines = []
+        company = str(
+            self.config.get("company_name", "")
+            or ""
+        ).strip()
+        contact_name = self.get_config_or_env(
+            "contact_name",
+            "CONTACT_US_NAME"
+        ).strip()
+        contact_email = self.get_config_or_env(
+            "contact_email",
+            "CONTACT_US_EMAIL"
+        ).strip()
+        contact_phone = self.get_config_or_env(
+            "contact_phone",
+            "CONTACT_US_PHONE"
+        ).strip()
+        company_website = str(
+            self.config.get("company_website", "")
+            or ""
+        ).strip()
+
+        for label, value in [
+            ("Company", company),
+            ("Contact", contact_name),
+            ("Email", contact_email),
+            ("Phone", contact_phone),
+            ("Website", company_website),
+        ]:
+            if value:
+                lines.append(f"{label}: {value}")
+
+        if not lines:
+            return ""
+
+        return "Contact details:\n" + "\n".join(lines)
+
+    def channel_message(self, result, section):
+        message = (
+            result.get("proposal", "")
+            or ""
+        ).strip()
+
+        if not message:
+            return ""
+
+        include_contact_details = self.get_bool_setting(
+            section,
+            "include_contact_details",
+            default=True
+        )
+
+        if not include_contact_details:
+            return message
+
+        contact_details = self.contact_details_block()
+        if not contact_details:
+            return message
+
+        return f"{message}\n\n{contact_details}"
 
 
     def get_config_or_env(self, config_key, env_key, default=""):
@@ -2494,7 +2563,10 @@ class Automation:
             return False
 
         message = (
-            result.get("proposal", "")
+            self.channel_message(
+                result,
+                "whatsapp"
+            )
             or ""
         ).strip()
 
@@ -2698,7 +2770,10 @@ class Automation:
             return False
 
         message = (
-            result.get("proposal", "")
+            self.channel_message(
+                result,
+                "email"
+            )
             or ""
         ).strip()
 
@@ -2924,11 +2999,15 @@ class Automation:
         path = self.data_dir / "outreach_drafts.csv"
         exists = path.exists()
         message = result.get("proposal", "")
+        whatsapp_message = self.channel_message(
+            result,
+            "whatsapp"
+        )
         phone = (result.get("phones") or [""])[0]
         digits = re.sub(r"\D", "", phone)
         whatsapp_url = ""
-        if digits and message:
-            whatsapp_url = f"https://wa.me/{digits}?text={quote_plus(message)}"
+        if digits and whatsapp_message:
+            whatsapp_url = f"https://wa.me/{digits}?text={quote_plus(whatsapp_message)}"
         fields = ["business_name", "website", "contact_page", "emails", "phones",
                   "proposal", "form_prefilled", "whatsapp_sent", "email_sent",
                   "whatsapp_review_url", "status"]
@@ -3566,7 +3645,9 @@ class Automation:
         Fill normal inputs, textareas, selects, and contenteditable fields.
         """
 
-        value = value or ""
+        value = str(value or "").strip()
+        if not value:
+            return False
 
         try:
             tag_name = field.tag_name.lower()

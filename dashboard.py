@@ -46,6 +46,126 @@ COLORS = {
     "white": "#ffffff",
 }
 
+DEFAULT_CONFIG = {
+    "headless": False,
+    "chrome_profile_dir": "chrome_profile",
+    "chatgpt_profile_dir": "chatgpt_profile",
+    "search_query": "business near me",
+    "limit": 10,
+    "openai_model": "gpt-5.5",
+    "data_dir": "data",
+    "review_mode": True,
+    "keep_prefilled_tabs_open": True,
+    "skip_previously_processed": True,
+    "ignore_urls": [],
+    "company_name": "",
+    "company_website": "",
+    "contact_name": "",
+    "contact_email": "",
+    "contact_phone": "",
+    "default_country_code": "971",
+    "website_forms": {
+        "include_contact_details": True,
+    },
+    "whatsapp": {
+        "enabled": True,
+        "auto_send": False,
+        "include_contact_details": True,
+        "open_for_review": True,
+        "keep_tabs_open": False,
+        "send_timeout_seconds": 10,
+        "default_country_code": "971",
+        "ignore_phone_prefixes": [],
+    },
+    "email": {
+        "enabled": True,
+        "auto_send": False,
+        "include_contact_details": True,
+        "smtp_host": "",
+        "smtp_port": 587,
+        "smtp_username": "",
+        "smtp_password": "",
+        "from_email": "",
+        "from_name": "",
+        "subject": "Website development proposal",
+        "send_to_all_found": False,
+        "use_tls": True,
+        "use_ssl": False,
+    },
+}
+
+SETTINGS_SECTIONS = [
+    (
+        "Run",
+        [
+            {"path": ("search_query",), "label": "Search Query", "type": "text"},
+            {"path": ("limit",), "label": "Lead Limit", "type": "int", "min": 1},
+            {"path": ("headless",), "label": "Headless Browser", "type": "bool"},
+            {"path": ("review_mode",), "label": "Review Mode", "type": "bool"},
+            {"path": ("keep_prefilled_tabs_open",), "label": "Keep Prefilled Tabs Open", "type": "bool"},
+            {"path": ("skip_previously_processed",), "label": "Skip Previously Processed", "type": "bool"},
+            {"path": ("data_dir",), "label": "Data Folder", "type": "text"},
+            {"path": ("chrome_profile_dir",), "label": "Chrome Profile Folder", "type": "text"},
+            {"path": ("chatgpt_profile_dir",), "label": "ChatGPT Profile Folder", "type": "text"},
+            {"path": ("openai_model",), "label": "OpenAI Model", "type": "text"},
+        ],
+    ),
+    (
+        "Company",
+        [
+            {"path": ("company_name",), "label": "Company Name", "type": "text"},
+            {"path": ("company_website",), "label": "Company Website", "type": "text"},
+            {"path": ("contact_name",), "label": "Contact Name", "type": "text"},
+            {"path": ("contact_email",), "label": "Contact Email", "type": "text"},
+            {"path": ("contact_phone",), "label": "Contact Phone", "type": "text"},
+            {"path": ("default_country_code",), "label": "Default Country Code", "type": "text"},
+        ],
+    ),
+    (
+        "Website Forms",
+        [
+            {"path": ("website_forms", "include_contact_details"), "label": "Include Contact Details", "type": "bool"},
+        ],
+    ),
+    (
+        "Ignore URLs",
+        [
+            {"path": ("ignore_urls",), "label": "Ignored Domains / URLs", "type": "list", "height": 18},
+        ],
+    ),
+    (
+        "WhatsApp",
+        [
+            {"path": ("whatsapp", "enabled"), "label": "Enabled", "type": "bool"},
+            {"path": ("whatsapp", "auto_send"), "label": "Auto Send", "type": "bool"},
+            {"path": ("whatsapp", "include_contact_details"), "label": "Include Contact Details", "type": "bool"},
+            {"path": ("whatsapp", "open_for_review"), "label": "Open For Review", "type": "bool"},
+            {"path": ("whatsapp", "keep_tabs_open"), "label": "Keep Tabs Open", "type": "bool"},
+            {"path": ("whatsapp", "send_timeout_seconds"), "label": "Send Timeout Seconds", "type": "int", "min": 1},
+            {"path": ("whatsapp", "default_country_code"), "label": "Default Country Code", "type": "text"},
+            {"path": ("whatsapp", "ignore_phone_prefixes"), "label": "Ignored Phone Prefixes", "type": "list", "height": 8},
+        ],
+    ),
+    (
+        "Email",
+        [
+            {"path": ("email", "enabled"), "label": "Enabled", "type": "bool"},
+            {"path": ("email", "auto_send"), "label": "Auto Send", "type": "bool"},
+            {"path": ("email", "include_contact_details"), "label": "Include Contact Details", "type": "bool"},
+            {"path": ("email", "smtp_host"), "label": "SMTP Host", "type": "text"},
+            {"path": ("email", "smtp_port"), "label": "SMTP Port", "type": "int", "min": 1, "max": 65535},
+            {"path": ("email", "smtp_username"), "label": "SMTP Username", "type": "text"},
+            {"path": ("email", "smtp_password"), "label": "SMTP Password", "type": "password"},
+            {"path": ("email", "from_email"), "label": "From Email", "type": "text"},
+            {"path": ("email", "from_name"), "label": "From Name", "type": "text"},
+            {"path": ("email", "subject"), "label": "Subject", "type": "text"},
+            {"path": ("email", "send_to_all_found"), "label": "Send To All Found", "type": "bool"},
+            {"path": ("email", "use_tls"), "label": "Use TLS", "type": "bool"},
+            {"path": ("email", "use_ssl"), "label": "Use SSL", "type": "bool"},
+        ],
+    ),
+]
+
 
 def read_json(path):
     try:
@@ -53,6 +173,52 @@ def read_json(path):
             return json.load(handle)
     except Exception:
         return {}
+
+
+def write_json(path, data):
+    with path.open("w", encoding="utf-8") as handle:
+        json.dump(data, handle, indent=4)
+        handle.write("\n")
+
+
+def merge_config(defaults, current):
+    merged = json.loads(json.dumps(defaults))
+    if not isinstance(current, dict):
+        return merged
+    for key, value in current.items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = merge_config(merged[key], value)
+        else:
+            merged[key] = value
+    return merged
+
+
+def get_config_value(config, path, default=""):
+    current = config
+    for part in path:
+        if not isinstance(current, dict) or part not in current:
+            return default
+        current = current[part]
+    return current
+
+
+def set_config_value(config, path, value):
+    current = config
+    for part in path[:-1]:
+        next_value = current.get(part)
+        if not isinstance(next_value, dict):
+            next_value = {}
+            current[part] = next_value
+        current = next_value
+    current[path[-1]] = value
+
+
+def to_bool(value):
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
 
 
 def parse_json_list(value):
@@ -108,6 +274,232 @@ def open_path(path):
         webbrowser.open(path.resolve().as_uri())
 
 
+class SettingsDialog(tk.Toplevel):
+    def __init__(self, parent, config_data, save_callback):
+        super().__init__(parent)
+        self.parent = parent
+        self.save_callback = save_callback
+        self.raw_config = dict(config_data or {})
+        self.config_data = merge_config(DEFAULT_CONFIG, self.raw_config)
+        self.variables = {}
+        self.text_widgets = {}
+
+        self.title("Dashboard Settings")
+        self.geometry("780x680")
+        self.minsize(680, 540)
+        self.configure(bg=COLORS["bg"])
+        self.transient(parent)
+
+        self.build_layout()
+        self.load_values()
+        self.grab_set()
+
+    def build_layout(self):
+        shell = tk.Frame(self, bg=COLORS["bg"], padx=18, pady=16)
+        shell.pack(fill="both", expand=True)
+
+        tk.Label(
+            shell,
+            text="Dashboard Settings",
+            bg=COLORS["bg"],
+            fg=COLORS["text"],
+            font=("Segoe UI", 18, "bold"),
+        ).pack(anchor="w")
+
+        self.notebook = ttk.Notebook(shell)
+        self.notebook.pack(fill="both", expand=True, pady=(14, 14))
+
+        for title, fields in SETTINGS_SECTIONS:
+            tab = self.scrollable_tab(self.notebook)
+            self.notebook.add(tab["outer"], text=title)
+            self.build_fields(tab["inner"], fields)
+
+        actions = tk.Frame(shell, bg=COLORS["bg"])
+        actions.pack(fill="x")
+
+        self.make_dialog_button(actions, "Open JSON", lambda: open_path(CONFIG_PATH), COLORS["panel_3"]).pack(side="left")
+        self.make_dialog_button(actions, "Reload", self.reload_settings, COLORS["panel_3"]).pack(side="left", padx=(8, 0))
+        self.make_dialog_button(actions, "Cancel", self.destroy, COLORS["panel_3"]).pack(side="right")
+        self.make_dialog_button(actions, "Save Settings", self.save_settings, COLORS["accent"]).pack(side="right", padx=(0, 8))
+
+    def scrollable_tab(self, parent):
+        outer = tk.Frame(parent, bg=COLORS["panel"])
+        canvas = tk.Canvas(outer, bg=COLORS["panel"], highlightthickness=0)
+        scrollbar = ttk.Scrollbar(outer, orient="vertical", command=canvas.yview)
+        inner = tk.Frame(canvas, bg=COLORS["panel"], padx=16, pady=16)
+        window_id = canvas.create_window((0, 0), window=inner, anchor="nw")
+
+        def update_scroll_region(_event=None):
+            canvas.configure(scrollregion=canvas.bbox("all"))
+
+        def update_inner_width(event):
+            canvas.itemconfigure(window_id, width=event.width)
+
+        inner.bind("<Configure>", update_scroll_region)
+        canvas.bind("<Configure>", update_inner_width)
+        canvas.configure(yscrollcommand=scrollbar.set)
+        canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+        return {"outer": outer, "inner": inner}
+
+    def build_fields(self, parent, fields):
+        parent.grid_columnconfigure(1, weight=1)
+        for row, field in enumerate(fields):
+            label = tk.Label(
+                parent,
+                text=field["label"],
+                bg=COLORS["panel"],
+                fg=COLORS["muted"],
+                font=("Segoe UI", 10, "bold"),
+                anchor="w",
+            )
+            label.grid(row=row, column=0, sticky="nw", padx=(0, 14), pady=(8, 8))
+
+            path_key = ".".join(field["path"])
+            field_type = field["type"]
+
+            if field_type == "bool":
+                variable = tk.BooleanVar()
+                widget = tk.Checkbutton(
+                    parent,
+                    variable=variable,
+                    bg=COLORS["panel"],
+                    activebackground=COLORS["panel"],
+                    selectcolor=COLORS["panel_3"],
+                    fg=COLORS["text"],
+                    activeforeground=COLORS["text"],
+                    relief="flat",
+                )
+                widget.grid(row=row, column=1, sticky="w", pady=(8, 8))
+                self.variables[path_key] = (field, variable)
+            elif field_type == "list":
+                text = tk.Text(
+                    parent,
+                    height=field.get("height", 6),
+                    bg=COLORS["panel_2"],
+                    fg=COLORS["text"],
+                    insertbackground=COLORS["text"],
+                    relief="flat",
+                    wrap="word",
+                    font=("Consolas", 10),
+                )
+                text.grid(row=row, column=1, sticky="ew", pady=(8, 8), ipady=4)
+                self.text_widgets[path_key] = (field, text)
+            else:
+                variable = tk.StringVar()
+                widget = tk.Entry(
+                    parent,
+                    textvariable=variable,
+                    bg=COLORS["panel_2"],
+                    fg=COLORS["text"],
+                    insertbackground=COLORS["text"],
+                    relief="flat",
+                    font=("Segoe UI", 10),
+                    show="*" if field_type == "password" else "",
+                )
+                widget.grid(row=row, column=1, sticky="ew", pady=(8, 8), ipady=7)
+                self.variables[path_key] = (field, variable)
+
+    def make_dialog_button(self, parent, text, command, color):
+        fg = COLORS["bg"] if color in {COLORS["accent"], COLORS["accent_2"], COLORS["warning"], COLORS["good"]} else COLORS["text"]
+        return tk.Button(
+            parent,
+            text=text,
+            command=command,
+            bg=color,
+            fg=fg,
+            activebackground=color,
+            activeforeground=fg,
+            relief="flat",
+            padx=12,
+            pady=8,
+            cursor="hand2",
+            font=("Segoe UI", 9, "bold"),
+        )
+
+    def load_values(self):
+        self.config_data = merge_config(DEFAULT_CONFIG, self.raw_config)
+        for path_key, (field, variable) in self.variables.items():
+            value = get_config_value(self.config_data, field["path"], "")
+            if field["type"] == "bool":
+                variable.set(to_bool(value))
+            else:
+                variable.set("" if value is None else str(value))
+        for path_key, (field, widget) in self.text_widgets.items():
+            value = get_config_value(self.config_data, field["path"], [])
+            widget.delete("1.0", "end")
+            if isinstance(value, list):
+                widget.insert("1.0", "\n".join(str(item) for item in value))
+            elif value:
+                widget.insert("1.0", str(value))
+
+    def reload_settings(self):
+        if not messagebox.askyesno("Reload settings", "Discard unsaved changes and reload config.json?"):
+            return
+        self.raw_config = read_json(CONFIG_PATH)
+        self.load_values()
+
+    def save_settings(self):
+        try:
+            new_config = self.collect_config()
+            self.save_callback(new_config)
+        except ValueError as exc:
+            messagebox.showerror("Invalid setting", str(exc))
+            return
+        except Exception as exc:
+            messagebox.showerror("Could not save settings", str(exc))
+            return
+
+        messagebox.showinfo("Settings saved", "Settings saved to config.json.")
+        self.destroy()
+
+    def collect_config(self):
+        new_config = merge_config(DEFAULT_CONFIG, self.raw_config)
+
+        for path_key, (field, variable) in self.variables.items():
+            field_type = field["type"]
+            raw_value = variable.get()
+
+            if field_type == "bool":
+                value = to_bool(raw_value)
+            elif field_type == "int":
+                text = str(raw_value).strip()
+                if not text:
+                    text = str(get_config_value(DEFAULT_CONFIG, field["path"], 0))
+                try:
+                    value = int(text)
+                except ValueError as exc:
+                    raise ValueError(f"{field['label']} must be a whole number.") from exc
+                if "min" in field and value < field["min"]:
+                    raise ValueError(f"{field['label']} must be at least {field['min']}.")
+                if "max" in field and value > field["max"]:
+                    raise ValueError(f"{field['label']} must be {field['max']} or lower.")
+            else:
+                value = str(raw_value).strip()
+
+            set_config_value(new_config, field["path"], value)
+
+        for path_key, (field, widget) in self.text_widgets.items():
+            raw_text = widget.get("1.0", "end").strip()
+            value = parse_settings_list(raw_text)
+            set_config_value(new_config, field["path"], value)
+
+        return new_config
+
+
+def parse_settings_list(value):
+    if not value:
+        return []
+    text = str(value).strip()
+    try:
+        parsed = json.loads(text)
+        if isinstance(parsed, list):
+            return [str(item).strip() for item in parsed if str(item).strip()]
+    except Exception:
+        pass
+    return [part.strip() for part in re.split(r"[\n;,]+", text) if part.strip()]
+
+
 class MarketingDashboard(tk.Tk):
     def __init__(self):
         super().__init__()
@@ -120,6 +512,7 @@ class MarketingDashboard(tk.Tk):
         self.rows = []
         self.row_by_key = {}
         self.process = None
+        self.settings_window = None
         self.output_queue = queue.Queue()
 
         self.status_var = tk.StringVar(value="Ready")
@@ -214,6 +607,8 @@ class MarketingDashboard(tk.Tk):
         self.finish_button.pack(side="left", padx=(0, 8))
         self.stop_button = self.make_button(actions, "Stop", self.stop_bot, COLORS["danger"])
         self.stop_button.pack(side="left", padx=(0, 8))
+        self.settings_button = self.make_button(actions, "Settings", self.open_settings, COLORS["panel_3"])
+        self.settings_button.pack(side="left", padx=(0, 8))
         self.refresh_button = self.make_button(actions, "Refresh", self.load_data, COLORS["panel_3"])
         self.refresh_button.pack(side="left")
 
@@ -384,6 +779,55 @@ class MarketingDashboard(tk.Tk):
             cursor="hand2",
             font=("Segoe UI", 9, "bold"),
         )
+
+    def open_settings(self):
+        if self.settings_window and self.settings_window.winfo_exists():
+            self.settings_window.lift()
+            self.settings_window.focus_force()
+            return
+        self.config_data = read_json(CONFIG_PATH)
+        self.settings_window = SettingsDialog(self, self.config_data, self.save_settings)
+
+    def save_settings(self, config_data):
+        write_json(CONFIG_PATH, config_data)
+        self.config_data = config_data
+        self.status_var.set("Settings saved")
+        self.load_data()
+
+    def contact_details_block(self, config):
+        lines = []
+        for label, key in [
+            ("Company", "company_name"),
+            ("Contact", "contact_name"),
+            ("Email", "contact_email"),
+            ("Phone", "contact_phone"),
+            ("Website", "company_website"),
+        ]:
+            value = str(config.get(key, "") or "").strip()
+            if value:
+                lines.append(f"{label}: {value}")
+        if not lines:
+            return ""
+        return "Contact details:\n" + "\n".join(lines)
+
+    def channel_message(self, message, section):
+        text = str(message or "").strip()
+        if not text:
+            return ""
+        config = merge_config(DEFAULT_CONFIG, read_json(CONFIG_PATH))
+        include_contact_details = to_bool(
+            get_config_value(
+                config,
+                (section, "include_contact_details"),
+                True
+            )
+        )
+        if not include_contact_details:
+            return text
+        contact_details = self.contact_details_block(config)
+        if not contact_details:
+            return text
+        return f"{text}\n\n{contact_details}"
 
     def data_dir(self):
         self.config_data = read_json(CONFIG_PATH)
@@ -623,9 +1067,13 @@ class MarketingDashboard(tk.Tk):
     def whatsapp_url(self, row):
         phone = next((item for item in row["phones"] if re.sub(r"\D", "", item)), "")
         digits = re.sub(r"\D", "", phone)
-        if not digits or not row["proposal"]:
+        message = self.channel_message(
+            row["proposal"],
+            "whatsapp"
+        )
+        if not digits or not message:
             return ""
-        return f"https://wa.me/{digits}?text={quote_plus(row['proposal'])}"
+        return f"https://wa.me/{digits}?text={quote_plus(message)}"
 
     def open_drafts_csv(self):
         open_path(self.data_dir() / "outreach_drafts.csv")
