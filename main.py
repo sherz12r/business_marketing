@@ -518,6 +518,10 @@ class Automation:
                     "//a[contains(., 'More places')]",
                     "//a[contains(., 'More businesses')]",
                     "//*[@role='button'][contains(., 'More places')]",
+                    "//*[@role='button'][contains(., 'More businesses')]",
+                    "//a[contains(@aria-label, 'More places')]",
+                    "//a[contains(@aria-label, 'More businesses')]",
+                    "//a[contains(@href, 'tbm=lcl')]",
                 ]:
                     try:
                         more = self.driver.find_element(By.XPATH, xpath)
@@ -1725,6 +1729,50 @@ class Automation:
     # PROCESS ALL WEBSITES
     # =========================================================
 
+    def go_to_next_google_page(self):
+        """Open Google's next result page and wait until it is ready."""
+        current_url = self.driver.current_url
+
+        selectors = [
+            (By.ID, "pnnext"),
+            (By.CSS_SELECTOR, "a[aria-label='Next page']"),
+            (By.CSS_SELECTOR, "a[aria-label='Next']"),
+            (By.XPATH, "//a[.//span[normalize-space()='Next']]"),
+        ]
+
+        next_link = None
+        for by, selector in selectors:
+            try:
+                candidate = self.driver.find_element(by, selector)
+                if candidate.is_displayed():
+                    next_link = candidate
+                    break
+            except Exception:
+                continue
+
+        if next_link is None:
+            self._log("No next Google results page was found.")
+            return False
+
+        try:
+            next_url = next_link.get_attribute("href")
+            if next_url:
+                self.driver.get(next_url)
+            else:
+                self.driver.execute_script("arguments[0].click();", next_link)
+
+            WebDriverWait(self.driver, 20).until(
+                lambda driver: driver.current_url != current_url
+            )
+            WebDriverWait(self.driver, 20).until(
+                EC.presence_of_element_located((By.TAG_NAME, "body"))
+            )
+            self.random_sleep()
+            return True
+        except Exception as e:
+            self._log(f"Could not open the next Google results page: {e}")
+            return False
+
     def process_all_websites(
         self,
         google_page,
@@ -1735,37 +1783,73 @@ class Automation:
             "PROCESSING GOOGLE RESULTS"
         )
 
-        # -----------------------------------------
-        # Get websites from Google
-        # -----------------------------------------
-        # self._log(google_page)
-        # input("get_google_websites")
-        websites = self.get_google_websites(
-            google_page
-        )
+        results = []
+        seen_candidates = set()
+        page_number = 1
+        max_pages = max(1, int(self.config.get("google_max_pages", 20)))
 
-        if not websites:
+        while page_number <= max_pages:
+            completed = sum(
+                1 for item in results
+                if item.get("status") not in {"skipped_duplicate", "ignored_url"}
+            )
+            if completed >= limit:
+                break
 
+            self._log(f"Reading Google results page {page_number}...")
+            websites = self.get_google_websites(google_page)
             self._log(
-                "No websites found from Google."
+                f"Page {page_number} has {len(websites)} candidates; "
+                f"{completed}/{limit} new businesses completed."
             )
 
-            return []
+            # A normal Google web-results page can still have a generic Next
+            # link even though it contains no local business cards. Do not
+            # follow that pagination blindly.
+            if not websites:
+                self._log(
+                    f"Google page {page_number} contains no business candidates; "
+                    "stopping instead of advancing blindly."
+                )
+                break
 
-        self._log(
-            f"Found {len(websites)} candidates; processing up to {limit} new businesses..."
-        )
+            page_candidates_checked = 0
+            for index, website in enumerate(websites, start=1):
+                completed = sum(
+                    1 for item in results
+                    if item.get("status") not in {"skipped_duplicate", "ignored_url"}
+                )
+                if completed >= limit:
+                    break
 
-        results = []
+                candidate_key = self.business_key(website)
+                if candidate_key in seen_candidates:
+                    page_candidates_checked += 1
+                    continue
+                seen_candidates.add(candidate_key)
 
-        # -----------------------------------------
-        # Process each website
-        # -----------------------------------------
+                url = website.get("url", "")
+                self._log(
+                    f"[page {page_number}; candidate {index}/{len(websites)}; "
+                    f"new {completed}/{limit}] {url}"
+                )
 
-        for index, website in enumerate(
-            websites,
-            start=1
-        ):
+                try:
+                    result = self.process_website(website)
+                    self._log(result)
+                    results.append(result)
+                except Exception as e:
+                    self._log(f"Error processing {url}: {e}")
+                    results.append({
+                        "name": website.get("name", ""),
+                        "website": url,
+                        "contact_page": "",
+                        "emails": [],
+                        "phones": [],
+                        "status": "error",
+                    })
+                finally:
+                    page_candidates_checked += 1
 
             completed = sum(
                 1 for item in results
@@ -1774,40 +1858,20 @@ class Automation:
             if completed >= limit:
                 break
 
-            url = website.get(
-                "url",
-                ""
-            )
+            if page_candidates_checked < len(websites):
+                self._log(
+                    f"Only checked {page_candidates_checked}/{len(websites)} candidates "
+                    f"on Google page {page_number}; not advancing."
+                )
+                break
 
             self._log(
-                f"[candidate {index}/{len(websites)}; new {completed}/{limit}] {url}"
+                f"Checked all {page_candidates_checked} business candidates on "
+                f"Google page {page_number}."
             )
-
-            try:
-
-                result = self.process_website(
-                    website
-                )
-                self._log(result)
-                results.append(result)
-
-            except Exception as e:
-
-                self._log(
-                    f"Error processing {url}: {e}"
-                )
-
-                # Still add a result
-                results.append({
-                    "name": website.get(
-                        "name",
-                        ""
-                    ),
-                    "website": url,
-                    "contact_page": "",
-                    "emails": [],
-                    "phones": []
-                })
+            if not self.go_to_next_google_page():
+                break
+            page_number += 1
 
         self._log(
             f"Finished processing "
