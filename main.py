@@ -8,12 +8,11 @@ from selenium.webdriver.common.keys import Keys
 from datetime import datetime, date, timedelta
 from selenium.webdriver.common.by import By
 import undetected_chromedriver as uc
-from tkinter import messagebox
 from email.message import EmailMessage
 from random import uniform
 from time import sleep
 import smtplib
-import tkinter as tk
+import mimetypes
 import sys
 import os, json, sys
 import asyncio
@@ -27,6 +26,7 @@ from urllib.parse import quote_plus
 from urllib.parse import urljoin, urlparse
 from playwright.sync_api import sync_playwright
 from dotenv import load_dotenv
+from app_paths import get_app_dir
 from progress_tracker import (
     EVENT_EMAIL_SENT,
     EVENT_FORM_PREFILLED,
@@ -84,6 +84,12 @@ IMPORTANT:
 - Do not mention that AI wrote the message.
 - Invite them to contact us if they are interested.
 - Mention that we can discuss their requirements and provide suitable recommendations.
+- Tailor the proposal to the business type. Mention all sender services that are
+  genuinely relevant to this specific business and explain their practical use.
+- Do not write a generic list or a general-purpose company introduction.
+- For a salon or beauty business, cover relevant needs such as a service and
+  appointment-booking website, POS, website updates and maintenance, local SEO,
+  digital marketing, business email, hosting, and suitable customer-management tools.
 - Do not include sender contact details such as contact name, email, phone, website, or a contact-us block.
 - Do not include a subject line unless specifically requested.
 
@@ -93,6 +99,7 @@ Return ONLY the proposal text."""
 PROPOSAL_SERVICES = [
     "Website Development",
     "E-commerce / Online Stores",
+    "Online Appointment and Booking Systems",
     "Website Redesign",
     "Responsive Mobile-Friendly Websites",
     "SEO & Digital Marketing",
@@ -100,6 +107,8 @@ PROPOSAL_SERVICES = [
     "Business Email Setup",
     "Accounting Software",
     "POS Solutions",
+    "CRM and Customer Management Solutions",
+    "Inventory Management Solutions",
     "E-Invoicing Software",
     "Website Maintenance & Support",
     "Domain & Hosting Setup",
@@ -121,7 +130,7 @@ class Automation:
 
     
     def _log(self, message):
-        print(f"[Marketing Bot] {message}")
+        print(f"[Marketing Bot] {message}", flush=True)
 
         # Skip file logging when started from dashboard.py
         if sys.argv[0].endswith("dashboard.py"):
@@ -136,8 +145,9 @@ class Automation:
         except OSError:
             pass
 
-    def __init__(self):
+    def __init__(self, mode="full"):
         self.config = self.read_json('config.json')
+        self.mode = mode
         
 
         if self.config:
@@ -146,7 +156,12 @@ class Automation:
         else:
             self._log("Warning: config.json is missing or empty — check your dashboard settings.")
 
-        self.headless = bool(self.config.get('headless', False))
+        headless_override = os.environ.get("AUTOMATION_HEADLESS")
+        self.headless = (
+            str(headless_override).strip().lower() in {"1", "true", "yes", "on"}
+            if headless_override is not None
+            else bool(self.config.get('headless', False))
+        )
         self.limit = max(1, int(self.config.get('limit', 10)))
         self.search_query = str(self.config.get('search_query', 'business near me')).strip()
         self.data_dir = Path(self.config.get('data_dir', 'data'))
@@ -159,6 +174,14 @@ class Automation:
         )''')
         ensure_progress_schema(self.db)
         self.db.commit()
+        self.driver = None
+        self.whatsapp_login_wait_used = False
+
+        if self.mode == "pending-email":
+            self.process_pending_channel("email")
+            self.db.close()
+            return
+
         browser_mode = "headless (no window)" if self.headless else "visible"
         self._log(f"Opening Chrome browser — {browser_mode}...")
         from app_paths import get_app_dir
@@ -184,8 +207,88 @@ class Automation:
 
         self._log("Browser ready.")
         self.iframe_found = False
+        if self.mode == "pending-whatsapp":
+            self.process_pending_channel("whatsapp")
+            self._close_browser_safely()
+        else:
+            self.start_automation()
 
-        self.start_automation()
+    def process_pending_channel(self, channel):
+        """Send drafts that do not yet have a sent event for one channel."""
+        event_type = EVENT_WHATSAPP_SENT if channel == "whatsapp" else EVENT_EMAIL_SENT
+        rows = self.db.execute(
+            """SELECT o.*,
+                      (o.status IN ('sent', 'submitted', 'email_sent', 'fallback_sent')
+                       OR EXISTS(SELECT 1 FROM outreach_events e
+                             WHERE e.business_key = o.business_key
+                               AND e.event_type = ?)) AS email_sent,
+                      (o.status IN ('whatsapp_sent', 'fallback_sent')
+                       OR EXISTS(SELECT 1 FROM outreach_events e
+                             WHERE e.business_key = o.business_key
+                               AND e.event_type = ?)) AS whatsapp_sent
+               FROM outreach o
+              WHERE NOT EXISTS (
+                    SELECT 1 FROM outreach_events pending
+                     WHERE pending.business_key = o.business_key
+                       AND pending.event_type = ?)
+                AND (CASE WHEN ? = ?
+                          THEN o.status NOT IN ('whatsapp_sent', 'fallback_sent')
+                          ELSE o.status NOT IN ('sent', 'submitted', 'email_sent', 'fallback_sent')
+                     END)
+              ORDER BY COALESCE(o.updated_at, '') ASC""",
+            (
+                EVENT_EMAIL_SENT, EVENT_WHATSAPP_SENT, event_type,
+                event_type, EVENT_WHATSAPP_SENT,
+            ),
+        ).fetchall()
+
+        self._log(f"Found {len(rows)} pending {channel} draft(s).")
+        section = self.config.get(channel, {})
+        if isinstance(section, dict):
+            section["auto_send"] = True
+
+        sent_count = 0
+        for index, row in enumerate(rows, start=1):
+            result = {
+                "name": row[1] or "",
+                "website": row[2] or "",
+                "contact_page": row[3] or "",
+                "emails": self.parse_stored_list(row[4]),
+                "phones": self.parse_stored_list(row[5]),
+                "proposal": row[6] or "",
+                "form_prefilled": bool(row[7]),
+                "status": row[8] or "draft_ready",
+                "email_sent": bool(row[10]),
+                "whatsapp_sent": bool(row[11]),
+            }
+            business_key = row[0]
+            self._log(
+                f"[{index}/{len(rows)}] Sending pending {channel} for "
+                f"{result['name'] or result['website'] or business_key}."
+            )
+            sent = (
+                self.send_whatsapp_message(result, business_key)
+                if channel == "whatsapp"
+                else self.send_email_message(result, business_key)
+            )
+            self.update_result_status(result)
+            self.save_outreach(business_key, result)
+            sent_count += int(sent)
+
+        self._log(
+            f"Pending {channel} run completed: {sent_count} sent, "
+            f"{len(rows) - sent_count} skipped or failed."
+        )
+
+    @staticmethod
+    def parse_stored_list(value):
+        if not value:
+            return []
+        try:
+            parsed = json.loads(value)
+            return parsed if isinstance(parsed, list) else []
+        except (TypeError, ValueError):
+            return [part.strip() for part in str(value).split(";") if part.strip()]
 
     def element_exists(self, selector: str, timeout: int = 30) -> bool:
         by = By.XPATH if selector.startswith("/") or selector.startswith("(") else By.CSS_SELECTOR
@@ -408,6 +511,27 @@ class Automation:
                 "Google search page opened successfully."
             )
 
+            # Google's initial local pack commonly contains only three cards.
+            # Open the expanded places list when the requested limit needs more.
+            if self.limit > 3:
+                for xpath in [
+                    "//a[contains(., 'More places')]",
+                    "//a[contains(., 'More businesses')]",
+                    "//*[@role='button'][contains(., 'More places')]",
+                ]:
+                    try:
+                        more = self.driver.find_element(By.XPATH, xpath)
+                        if more.is_displayed():
+                            self.driver.execute_script("arguments[0].click();", more)
+                            self._log("Opened expanded Google business results.")
+                            WebDriverWait(self.driver, 20).until(
+                                EC.presence_of_element_located((By.TAG_NAME, "body"))
+                            )
+                            self.random_sleep()
+                            break
+                    except Exception:
+                        continue
+
             # Give Google a little time to render
             self.random_sleep()
 
@@ -461,6 +585,22 @@ class Automation:
             #
             # https://example.com
             # =====================================================
+
+            # Scroll result panels/page to load additional businesses toward
+            # the configured maximum before extracting links and cards.
+            previous_card_count = 0
+            for _ in range(8):
+                cards = page.find_elements(By.CSS_SELECTOR, "div.w7Dbne, div.Nv2PK")
+                if len(cards) >= self.limit * 2 or (
+                    previous_card_count and len(cards) == previous_card_count
+                ):
+                    break
+                previous_card_count = len(cards)
+                page.execute_script(
+                    "const p=document.querySelector('[role=feed]');"
+                    "if(p){p.scrollTop=p.scrollHeight}else{window.scrollTo(0,document.body.scrollHeight)}"
+                )
+                sleep(1.2)
 
             website_links = page.find_elements(
                 By.XPATH,
@@ -666,9 +806,9 @@ class Automation:
             # Include visible Google business cards that have no website.
             # These can still be drafted for review when Google exposes a phone.
             known_names = {item.get("name", "").strip().lower() for item in websites}
-            for card in page.find_elements(By.CSS_SELECTOR, "div.w7Dbne"):
+            for card in page.find_elements(By.CSS_SELECTOR, "div.w7Dbne, div.Nv2PK"):
                 try:
-                    name_nodes = card.find_elements(By.CSS_SELECTOR, ".dbg0pd .OSrXXb")
+                    name_nodes = card.find_elements(By.CSS_SELECTOR, ".dbg0pd .OSrXXb, .qBF1Pd")
                     name = name_nodes[0].text.strip() if name_nodes else ""
                     if not name or name.lower() in known_names:
                         continue
@@ -1612,11 +1752,8 @@ class Automation:
 
             return []
 
-        # Limit number during testing
-        websites = websites[:limit]
-
         self._log(
-            f"Processing {len(websites)} websites..."
+            f"Found {len(websites)} candidates; processing up to {limit} new businesses..."
         )
 
         results = []
@@ -1630,13 +1767,20 @@ class Automation:
             start=1
         ):
 
+            completed = sum(
+                1 for item in results
+                if item.get("status") not in {"skipped_duplicate", "ignored_url"}
+            )
+            if completed >= limit:
+                break
+
             url = website.get(
                 "url",
                 ""
             )
 
             self._log(
-                f"[{index}/{len(websites)}] {url}"
+                f"[candidate {index}/{len(websites)}; new {completed}/{limit}] {url}"
             )
 
             try:
@@ -2205,7 +2349,7 @@ class Automation:
 
             context = p.chromium.launch_persistent_context(
                 user_data_dir=str(profile_dir),
-                headless=False,
+                headless=self.headless,
                 permissions=[
                     "clipboard-read",
                     "clipboard-write"
@@ -2369,6 +2513,25 @@ class Automation:
                 f"Proposal prompt format error: {exc}; using default prompt."
             )
             prompt = DEFAULT_PROPOSAL_PROMPT.format_map(prompt_values)
+
+        if not website_url:
+            prompt += (
+                "\n\nThis business has no website listed. Clearly and politely propose "
+                "creating a new professional business website for them. Do not imply "
+                "that they already have a website."
+            )
+
+        prompt += (
+            "\n\nTAILORING REQUIREMENT:\n"
+            "Identify the business type from the business name and search/category context. "
+            "Write a specific proposal for that type of business, not a generic marketing message. "
+            "Mention all services from the provided service list that are realistically useful "
+            "to this business, and briefly connect each service to a likely practical use without "
+            "claiming the business currently has a problem. For salons and beauty businesses, "
+            "include a service/appointment-booking website, POS, ongoing website updates and "
+            "maintenance, local SEO, digital marketing, business email, hosting, and relevant "
+            "customer or inventory management solutions. Keep the result focused and readable."
+        )
 
         lower_prompt = prompt.lower()
         final_rules = []
@@ -2582,6 +2745,21 @@ class Automation:
 
         return whatsapp_sent or email_sent
 
+    def channel_image_path(self, section):
+        if not self.get_bool_setting(section, "send_image", default=False):
+            return None
+        raw_path = str(self.get_section_setting(section, "image_path", default="") or "").strip()
+        if not raw_path:
+            self._log(f"{section.title()} image is enabled but no image file is selected.")
+            return None
+        path = Path(raw_path).expanduser()
+        if not path.is_absolute():
+            path = Path(get_app_dir()) / path
+        if not path.is_file():
+            self._log(f"{section.title()} image file was not found: {path}")
+            return None
+        return path.resolve()
+
     def update_result_status(self, result):
         if result.get("email_sent") and result.get("whatsapp_sent"):
             result["status"] = "fallback_sent"
@@ -2608,6 +2786,8 @@ class Automation:
             )
             or ""
         ).strip()
+        send_image = self.get_bool_setting("whatsapp", "send_image", default=False)
+        image_path = self.channel_image_path("whatsapp")
 
         phone = self.primary_whatsapp_phone(
             result
@@ -2617,8 +2797,12 @@ class Automation:
             self._log("WhatsApp fallback skipped: no usable phone number.")
             return False
 
-        if not message:
+        if not message and not image_path:
             self._log("WhatsApp fallback skipped: proposal message is empty.")
+            return False
+
+        if send_image and not image_path:
+            self._log("WhatsApp image send skipped: select a valid image file.")
             return False
 
         auto_send = self.get_bool_setting(
@@ -2637,24 +2821,24 @@ class Automation:
             self._log("WhatsApp fallback ready, but auto_send is off.")
             return False
 
-        url = (
-            f"https://web.whatsapp.com/send?"
-            f"phone={phone}&text={quote_plus(message)}"
-        )
+        # Enabling WhatsApp images always sends the image by itself. The AI
+        # proposal remains available for forms/email but is not sent as a
+        # WhatsApp caption or separate message.
+        outgoing_text = "" if send_image else message
+        url = f"https://web.whatsapp.com/send?phone={phone}"
+        if outgoing_text:
+            url += f"&text={quote_plus(outgoing_text)}"
 
         original_window = None
         whatsapp_window = None
-        send_timeout = max(
-            5,
-            min(
-                10,
-                int(self.get_section_setting(
-                    "whatsapp",
-                    "send_timeout_seconds",
-                    default=10
-                ))
-            )
-        )
+        send_timeout = max(5, int(self.get_section_setting(
+            "whatsapp", "send_timeout_seconds", default=10
+        )))
+        login_timeout = max(10, int(self.get_section_setting(
+            "whatsapp", "login_timeout_seconds", default=180
+        )))
+        button_timeout = login_timeout if not self.whatsapp_login_wait_used else send_timeout
+        message_sent = False
 
         try:
             original_window = self.driver.current_window_handle
@@ -2675,15 +2859,21 @@ class Automation:
                 f"WhatsApp opened for {phone}."
             )
 
-            if not auto_send:
+            if not self.whatsapp_login_wait_used:
                 self._log(
-                    "WhatsApp auto_send is off; message left open for review."
+                    f"Waiting up to {login_timeout} seconds for the first WhatsApp login..."
                 )
+
+            if image_path:
+                if not self.upload_whatsapp_image(image_path, timeout=button_timeout):
+                    return False
+                self._log(f"WhatsApp image attached: {image_path.name}")
+
+            if not auto_send:
+                self._log("WhatsApp content left open for review; auto_send is off.")
                 return False
 
-            send_button = self.find_whatsapp_send_button(
-                timeout=send_timeout
-            )
+            send_button = self.find_whatsapp_send_button(timeout=button_timeout)
 
             if not send_button:
                 self._log(
@@ -2692,7 +2882,9 @@ class Automation:
                 )
                 return False
 
+            self.whatsapp_login_wait_used = True
             send_button.click()
+            message_sent = True
             self.random_sleep()
             result["whatsapp_sent"] = True
             record_event(
@@ -2700,9 +2892,9 @@ class Automation:
                 EVENT_WHATSAPP_SENT,
                 business_key,
                 result,
-                details="WhatsApp message sent by fallback"
+                details="WhatsApp image sent" if image_path else "WhatsApp message sent by fallback"
             )
-            self._log("WhatsApp message sent.")
+            self._log("WhatsApp image sent." if image_path else "WhatsApp message sent.")
             return True
 
         except Exception as e:
@@ -2723,6 +2915,7 @@ class Automation:
                     whatsapp_window
                     and whatsapp_window in self.driver.window_handles
                     and not keep_tab_open
+                    and message_sent
                 ):
                     self.driver.switch_to.window(
                         whatsapp_window
@@ -2739,6 +2932,39 @@ class Automation:
 
             except Exception:
                 pass
+
+    def upload_whatsapp_image(self, image_path, timeout=30):
+        try:
+            # Wait for the chat composer/login to become ready.
+            WebDriverWait(self.driver, timeout).until(
+                lambda driver: driver.find_elements(By.CSS_SELECTOR, "footer, [contenteditable='true']")
+            )
+            for by, selector in [
+                (By.CSS_SELECTOR, "button[aria-label='Attach']"),
+                (By.XPATH, "//*[@role='button' and @title='Attach']"),
+                (By.XPATH, "//span[@data-icon='plus-rounded']/ancestor::*[@role='button'][1]"),
+            ]:
+                try:
+                    button = self.driver.find_element(by, selector)
+                    self.driver.execute_script("arguments[0].click();", button)
+                    break
+                except Exception:
+                    continue
+
+            upload = WebDriverWait(self.driver, timeout).until(
+                lambda driver: next((
+                    item for item in driver.find_elements(By.CSS_SELECTOR, "input[type='file']")
+                    if "image" in (item.get_attribute("accept") or "").lower()
+                ), False)
+            )
+            upload.send_keys(str(image_path))
+            WebDriverWait(self.driver, timeout).until(
+                lambda driver: self.find_whatsapp_send_button(timeout=1)
+            )
+            return True
+        except Exception as exc:
+            self._log(f"Could not attach WhatsApp image: {exc}")
+            return False
 
     def find_whatsapp_send_button(self, timeout=10):
         selectors = [
@@ -2815,9 +3041,14 @@ class Automation:
             )
             or ""
         ).strip()
+        image_path = self.channel_image_path("email")
+        image_only = self.get_bool_setting("email", "image_only", default=False)
 
-        if not message:
+        if not message and not image_path:
             self._log("Email fallback skipped: proposal message is empty.")
+            return False
+        if image_only and not image_path:
+            self._log("Email image-only send skipped: select a valid image file.")
             return False
 
         if not auto_send:
@@ -2886,9 +3117,16 @@ class Automation:
         email["To"] = ", ".join(
             recipients
         )
-        email.set_content(
-            message
-        )
+        email.set_content("" if image_only else message)
+        if image_path:
+            mime_type, _ = mimetypes.guess_type(str(image_path))
+            major, minor = (mime_type or "application/octet-stream").split("/", 1)
+            email.add_attachment(
+                image_path.read_bytes(),
+                maintype=major,
+                subtype=minor,
+                filename=image_path.name,
+            )
 
         use_ssl = self.get_bool_setting(
             "email",
@@ -2938,7 +3176,7 @@ class Automation:
                 EVENT_EMAIL_SENT,
                 business_key,
                 result,
-                details=f"Email sent to {', '.join(recipients)}"
+                details=("Email image sent to " if image_path else "Email sent to ") + ", ".join(recipients)
             )
             self._log(
                 f"Email sent to {', '.join(recipients)}."
@@ -3005,11 +3243,28 @@ class Automation:
             return False
 
         row = self.db.execute(
-            "SELECT status FROM outreach WHERE business_key = ?", (business_key,)
+            "SELECT updated_at FROM outreach WHERE business_key = ?", (business_key,)
         ).fetchone()
-        # A draft or a partial send is not complete. Retry it on the next run
-        # so that both WhatsApp and email get a chance to be delivered.
-        return bool(row and row[0] == "fallback_sent")
+        if not row:
+            return False
+
+        cooldown_days = max(1, int(self.config.get("reprocess_after_days", 40)))
+        try:
+            last_processed = datetime.fromisoformat(str(row[0] or ""))
+            age = datetime.now() - last_processed
+            if age < timedelta(days=cooldown_days):
+                remaining = max(1, cooldown_days - age.days)
+                self._log(
+                    f"Skipping business processed recently; eligible again in "
+                    f"about {remaining} day(s)."
+                )
+                return True
+            return False
+        except (TypeError, ValueError):
+            # Old records without a usable timestamp remain protected rather
+            # than risking an immediate duplicate message.
+            self._log("Skipping previously processed business with no valid timestamp.")
+            return True
 
     def save_outreach(self, business_key, result):
         self.db.execute(
@@ -4025,7 +4280,12 @@ class Automation:
 
         
 if __name__ == "__main__":
-    print("[Marketing Bot] Launching Automation...")
-    automation = Automation()
-    print("[Marketing Bot] Session ended.")
+    mode = "full"
+    if "--pending-whatsapp" in sys.argv:
+        mode = "pending-whatsapp"
+    elif "--pending-email" in sys.argv:
+        mode = "pending-email"
+    print(f"[Marketing Bot] Launching {mode}...", flush=True)
+    automation = Automation(mode=mode)
+    print("[Marketing Bot] Session ended.", flush=True)
 

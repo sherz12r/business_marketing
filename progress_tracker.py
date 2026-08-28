@@ -56,11 +56,9 @@ def ensure_progress_schema(connection: sqlite3.Connection) -> None:
         """CREATE INDEX IF NOT EXISTS idx_outreach_events_business
            ON outreach_events(business_key, created_at)"""
     )
-    connection.execute(
-        """CREATE UNIQUE INDEX IF NOT EXISTS idx_outreach_events_once_per_business_type
-           ON outreach_events(business_key, event_type)
-           WHERE business_key IS NOT NULL AND business_key != ''"""
-    )
+    # Repeat outreach can be allowed after the configured cooldown, so event
+    # history must retain each later send rather than enforcing one event ever.
+    connection.execute("DROP INDEX IF EXISTS idx_outreach_events_once_per_business_type")
     connection.commit()
 
 
@@ -81,7 +79,7 @@ def record_event(
     result = result or {}
     ensure_progress_schema(connection)
     cursor = connection.execute(
-        """INSERT OR IGNORE INTO outreach_events (
+        """INSERT INTO outreach_events (
             business_key, business_name, website, event_type, details, created_at
         ) VALUES (?, ?, ?, ?, ?, ?)""",
         (

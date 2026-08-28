@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#08111f">
+  <title>Marketing Bot</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='dashboard.css') }}">
+</head>
+<body data-dashboard-url="{{ url_for('dashboard_data') }}" data-start-url="{{ url_for('start_job') }}" data-stop-url="{{ url_for('stop_job') }}" data-log-url="{{ url_for('job_log') }}" data-settings-url="{{ url_for('get_settings') }}">
+  <header class="topbar">
+    <div><span class="eyebrow">OUTREACH CONTROL</span><h1>Marketing Bot</h1></div>
+    <div class="status"><i id="statusDot"></i><span id="statusText">Ready</span></div>
+  </header>
+
+  <main>
+    <section class="hero">
+      <div><p class="eyebrow">TODAY'S WORKSPACE</p><h2>Run outreach from anywhere.</h2><p>Start scheduled work, review delivery progress, and follow live logs from your phone.</p></div>
+      <div class="actions">
+        <button class="primary" data-mode="full">Run automation</button>
+        <button data-mode="pending-whatsapp">Pending WhatsApp</button>
+        <button data-mode="pending-email">Pending emails</button>
+        <button id="settingsButton">Settings</button>
+        <button id="stopButton" class="danger hidden">Stop automation</button>
+      </div>
+    </section>
+
+    <section class="stats" aria-label="Outreach statistics">
+      <article><span>Leads</span><strong id="statLeads">0</strong></article>
+      <article><span>Websites</span><strong id="statWebsites">0</strong></article>
+      <article><span>Forms</span><strong id="statForms">0</strong></article>
+      <article><span>Emails</span><strong id="statEmails">0</strong></article>
+      <article><span>WhatsApp</span><strong id="statWhatsapp">0</strong></article>
+    </section>
+
+    <section class="grid">
+      <article class="panel leads-panel">
+        <div class="panel-title"><div><p class="eyebrow">PIPELINE</p><h3>Recent leads</h3></div><input id="search" type="search" placeholder="Search leads…" aria-label="Search leads"></div>
+        <div id="leadList" class="lead-list"><p class="empty">Loading leads…</p></div>
+      </article>
+      <article class="panel log-panel">
+        <div class="panel-title"><div><p class="eyebrow">RUN OUTPUT</p><h3>Live log</h3></div><button id="refreshButton" class="small">Refresh</button></div>
+        <pre id="logOutput" aria-live="polite">No automation output yet.</pre>
+      </article>
+    </section>
+  </main>
+  <dialog id="settingsDialog">
+    <form id="settingsForm">
+      <div class="dialog-header"><div><p class="eyebrow">CONFIGURATION</p><h3>Dashboard Settings</h3></div><button type="button" id="closeSettings" class="small" aria-label="Close settings">Close</button></div>
+      <div id="settingsTabs" class="settings-tabs"></div>
+      <div id="settingsFields" class="settings-fields"></div>
+      <div class="dialog-actions"><span id="settingsHint">Changes are saved to config.json.</span><button type="button" id="reloadSettings">Reload</button><button type="submit" class="primary">Save Settings</button></div>
+    </form>
+  </dialog>
+  <div id="toast" role="status" aria-live="polite"></div>
+  <script src="{{ url_for('static', filename='dashboard.js') }}" defer></script>
+</body>
+</html>

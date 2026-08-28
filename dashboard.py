@@ -11,7 +11,7 @@ import threading
 import webbrowser
 from datetime import datetime
 from pathlib import Path
-from tkinter import messagebox, ttk
+from tkinter import filedialog, messagebox, ttk
 from urllib.parse import quote_plus, urlparse
 import tkinter as tk
 
@@ -29,6 +29,7 @@ from progress_tracker import (
 APP_DIR = Path(get_app_dir())
 CONFIG_PATH = APP_DIR / "config.json"
 LOG_DIR = APP_DIR / "logs"
+WEB_JOB_STATE_PATH = APP_DIR / "data" / "runtime" / "web_job.json"
 
 COLORS = {
     "bg": "#0b1020",
@@ -80,6 +81,12 @@ IMPORTANT:
 - Do not mention that AI wrote the message.
 - Invite them to contact us if they are interested.
 - Mention that we can discuss their requirements and provide suitable recommendations.
+- Tailor the proposal to the business type. Mention all sender services that are
+  genuinely relevant to this specific business and explain their practical use.
+- Do not write a generic list or a general-purpose company introduction.
+- For a salon or beauty business, cover relevant needs such as a service and
+  appointment-booking website, POS, website updates and maintenance, local SEO,
+  digital marketing, business email, hosting, and suitable customer-management tools.
 - Do not include sender contact details such as contact name, email, phone, website, or a contact-us block.
 - Do not include a subject line unless specifically requested.
 
@@ -96,6 +103,7 @@ DEFAULT_CONFIG = {
     "review_mode": True,
     "keep_prefilled_tabs_open": True,
     "skip_previously_processed": True,
+    "reprocess_after_days": 40,
     "proposal_prompt": DEFAULT_PROPOSAL_PROMPT,
     "ignore_urls": [],
     "company_name": "",
@@ -114,8 +122,12 @@ DEFAULT_CONFIG = {
         "open_for_review": True,
         "keep_tabs_open": False,
         "send_timeout_seconds": 10,
+        "login_timeout_seconds": 180,
         "default_country_code": "971",
         "ignore_phone_prefixes": [],
+        "send_image": False,
+        "image_only": False,
+        "image_path": "",
     },
     "email": {
         "enabled": True,
@@ -131,6 +143,9 @@ DEFAULT_CONFIG = {
         "send_to_all_found": False,
         "use_tls": True,
         "use_ssl": False,
+        "send_image": False,
+        "image_only": False,
+        "image_path": "",
     },
 }
 
@@ -144,6 +159,7 @@ SETTINGS_SECTIONS = [
             {"path": ("review_mode",), "label": "Review Mode", "type": "bool"},
             {"path": ("keep_prefilled_tabs_open",), "label": "Keep Prefilled Tabs Open", "type": "bool"},
             {"path": ("skip_previously_processed",), "label": "Skip Previously Processed", "type": "bool"},
+            {"path": ("reprocess_after_days",), "label": "Allow Again After Days", "type": "int", "min": 1},
             {"path": ("data_dir",), "label": "Data Folder", "type": "text"},
             {"path": ("chrome_profile_dir",), "label": "Chrome Profile Folder", "type": "text"},
             {"path": ("chatgpt_profile_dir",), "label": "ChatGPT Profile Folder", "type": "text"},
@@ -184,12 +200,15 @@ SETTINGS_SECTIONS = [
         [
             {"path": ("whatsapp", "enabled"), "label": "Enabled", "type": "bool"},
             {"path": ("whatsapp", "auto_send"), "label": "Auto Send", "type": "bool"},
+            {"path": ("whatsapp", "send_image"), "label": "Send Image Only (No AI Message)", "type": "bool"},
+            {"path": ("whatsapp", "image_path"), "label": "Image File", "type": "file"},
             {"path": ("whatsapp", "include_contact_details"), "label": "Include Contact Details", "type": "bool"},
             {"path": ("whatsapp", "open_for_review"), "label": "Open For Review", "type": "bool"},
             {"path": ("whatsapp", "keep_tabs_open"), "label": "Keep Tabs Open", "type": "bool"},
             {"path": ("whatsapp", "send_timeout_seconds"), "label": "Send Timeout Seconds", "type": "int", "min": 1},
+            {"path": ("whatsapp", "login_timeout_seconds"), "label": "First Login Timeout Seconds", "type": "int", "min": 10},
             {"path": ("whatsapp", "default_country_code"), "label": "Default Country Code", "type": "text"},
-            {"path": ("whatsapp", "ignore_phone_prefixes"), "label": "Ignored Phone Prefixes", "type": "list", "height": 8},
+            {"path": ("whatsapp", "ignore_phone_prefixes"), "label": "Ignored Phone Prefixes", "type": "list", "height": 5},
         ],
     ),
     (
@@ -197,6 +216,9 @@ SETTINGS_SECTIONS = [
         [
             {"path": ("email", "enabled"), "label": "Enabled", "type": "bool"},
             {"path": ("email", "auto_send"), "label": "Auto Send", "type": "bool"},
+            {"path": ("email", "send_image"), "label": "Attach Image", "type": "bool"},
+            {"path": ("email", "image_only"), "label": "Send Image Instead of Message", "type": "bool"},
+            {"path": ("email", "image_path"), "label": "Image File", "type": "file"},
             {"path": ("email", "include_contact_details"), "label": "Include Contact Details", "type": "bool"},
             {"path": ("email", "smtp_host"), "label": "SMTP Host", "type": "text"},
             {"path": ("email", "smtp_port"), "label": "SMTP Port", "type": "int", "min": 1, "max": 65535},
@@ -384,6 +406,14 @@ class SettingsDialog(tk.Toplevel):
         inner.bind("<Configure>", update_scroll_region)
         canvas.bind("<Configure>", update_inner_width)
         canvas.configure(yscrollcommand=scrollbar.set)
+        canvas.bind(
+            "<Enter>",
+            lambda _event: canvas.bind_all(
+                "<MouseWheel>",
+                lambda event: canvas.yview_scroll(int(-event.delta / 120), "units"),
+            ),
+        )
+        canvas.bind("<Leave>", lambda _event: canvas.unbind_all("<MouseWheel>"))
         canvas.pack(side="left", fill="both", expand=True)
         scrollbar.pack(side="right", fill="y")
         return {"outer": outer, "inner": inner}
@@ -433,8 +463,11 @@ class SettingsDialog(tk.Toplevel):
                 self.text_widgets[path_key] = (field, text)
             else:
                 variable = tk.StringVar()
+                field_frame = tk.Frame(parent, bg=COLORS["panel"])
+                field_frame.grid(row=row, column=1, sticky="ew", pady=(8, 8))
+                field_frame.grid_columnconfigure(0, weight=1)
                 widget = tk.Entry(
-                    parent,
+                    field_frame,
                     textvariable=variable,
                     bg=COLORS["panel_2"],
                     fg=COLORS["text"],
@@ -443,8 +476,27 @@ class SettingsDialog(tk.Toplevel):
                     font=("Segoe UI", 10),
                     show="*" if field_type == "password" else "",
                 )
-                widget.grid(row=row, column=1, sticky="ew", pady=(8, 8), ipady=7)
+                widget.grid(row=0, column=0, sticky="ew", ipady=7)
+                if field_type == "file":
+                    tk.Button(
+                        field_frame, text="Browse...",
+                        command=lambda target=variable: self.choose_image(target),
+                        bg=COLORS["panel_3"], fg=COLORS["text"], relief="flat",
+                        padx=10, pady=7, cursor="hand2",
+                    ).grid(row=0, column=1, padx=(8, 0))
                 self.variables[path_key] = (field, variable)
+
+    def choose_image(self, variable):
+        selected = filedialog.askopenfilename(
+            parent=self,
+            title="Select image",
+            filetypes=[
+                ("Image files", "*.png *.jpg *.jpeg *.gif *.webp"),
+                ("All files", "*.*"),
+            ],
+        )
+        if selected:
+            variable.set(selected)
 
     def make_dialog_button(self, parent, text, command, color):
         fg = COLORS["bg"] if color in {COLORS["accent"], COLORS["accent_2"], COLORS["warning"], COLORS["good"]} else COLORS["text"]
@@ -652,10 +704,21 @@ class MarketingDashboard(tk.Tk):
 
         self.run_button = self.make_button(actions, "Run Bot", self.start_bot, COLORS["accent"])
         self.run_button.pack(side="left", padx=(0, 8))
+        self.pending_whatsapp_button = self.make_button(
+            actions, "Send Pending WhatsApp",
+            lambda: self.start_bot("pending-whatsapp", "pending WhatsApp"),
+            COLORS["warning"],
+        )
+        self.pending_whatsapp_button.pack(side="left", padx=(0, 8))
+        self.pending_email_button = self.make_button(
+            actions, "Send Pending Emails",
+            lambda: self.start_bot("pending-email", "pending emails"),
+            COLORS["accent_2"],
+        )
+        self.pending_email_button.pack(side="left", padx=(0, 8))
         self.finish_button = self.make_button(actions, "Finish Review", self.finish_review, COLORS["warning"])
         self.finish_button.pack(side="left", padx=(0, 8))
         self.stop_button = self.make_button(actions, "Stop", self.stop_bot, COLORS["danger"])
-        self.stop_button.pack(side="left", padx=(0, 8))
         self.settings_button = self.make_button(actions, "Settings", self.open_settings, COLORS["panel_3"])
         self.settings_button.pack(side="left", padx=(0, 8))
         self.refresh_button = self.make_button(actions, "Refresh", self.load_data, COLORS["panel_3"])
@@ -1127,15 +1190,41 @@ class MarketingDashboard(tk.Tk):
     def open_drafts_csv(self):
         open_path(self.data_dir() / "outreach_drafts.csv")
 
-    def start_bot(self):
+    def start_bot(self, mode="full", label="automation"):
         if self.is_running():
             self.status_var.set("Automation already running")
             return
+        other_run = self.active_web_dashboard_run()
+        if other_run:
+            messagebox.showwarning(
+                "Automation already running",
+                "Another automation was started from the web dashboard "
+                f"(PID {other_run['pid']}). Stop it before starting this run."
+            )
+            self.status_var.set("Another automation is running")
+            return
         self.clear_log()
-        self.append_log("Starting automation...")
+        self.append_log(f"Starting {label}...")
         try:
+            python_executable = Path(sys.executable)
+            if os.name == "nt" and python_executable.name.lower() == "pythonw.exe":
+                console_python = python_executable.with_name("python.exe")
+                if console_python.exists():
+                    python_executable = console_python
+            command = [str(python_executable), "-u", str(APP_DIR / "main.py")]
+            if mode != "full":
+                command.append(f"--{mode}")
+            process_environment = {
+                **os.environ,
+                "PYTHONUNBUFFERED": "1",
+                "PYTHONIOENCODING": "utf-8",
+            }
+            # The desktop dashboard must respect config.json's headless setting,
+            # not an override inherited from a previously launched web server.
+            process_environment.pop("AUTOMATION_HEADLESS", None)
+            creation_flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
             self.process = subprocess.Popen(
-                [sys.executable, str(APP_DIR / "main.py")],
+                command,
                 cwd=str(APP_DIR),
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
@@ -1144,33 +1233,55 @@ class MarketingDashboard(tk.Tk):
                 encoding="utf-8",
                 errors="replace",
                 bufsize=1,
+                env=process_environment,
+                creationflags=creation_flags,
             )
             threading.Thread(target=self.read_process_output, daemon=True).start()
-            self.status_var.set("Automation running")
+            self.status_var.set(f"Running {label}")
+            self.stop_button.pack(side="left", padx=(0, 8), before=self.settings_button)
         except Exception as exc:
             self.process = None
             messagebox.showerror("Could not start bot", str(exc))
             self.status_var.set("Start failed")
 
+    def active_web_dashboard_run(self):
+        try:
+            state = json.loads(WEB_JOB_STATE_PATH.read_text(encoding="utf-8"))
+            pid = int(state.get("pid", 0))
+            if pid <= 0 or state.get("status") not in {"running", "stopping"}:
+                return None
+            os.kill(pid, 0)
+            return {"pid": pid, "mode": state.get("mode", "automation")}
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            return None
+
     def read_process_output(self):
-        if not self.process or not self.process.stdout:
+        process = self.process
+        if not process or not process.stdout:
             return
-        for line in self.process.stdout:
-            self.output_queue.put(line.rstrip())
-        self.output_queue.put("__PROCESS_ENDED__")
+        try:
+            for line in iter(process.stdout.readline, ""):
+                self.output_queue.put(("line", line.rstrip("\r\n")))
+        except Exception as exc:
+            self.output_queue.put(("line", f"Log reader error: {exc}"))
+        finally:
+            process.stdout.close()
+            self.output_queue.put(("ended", process.wait()))
 
     def poll_process_output(self):
         try:
             while True:
                 item = self.output_queue.get_nowait()
-                if item == "__PROCESS_ENDED__":
-                    code = self.process.poll() if self.process else None
+                kind, value = item
+                if kind == "ended":
+                    code = value
                     self.append_log(f"Automation ended with code {code}.")
                     self.status_var.set("Ready")
+                    self.stop_button.pack_forget()
                     self.load_data()
                 else:
-                    self.append_log(item)
-                    if "press Enter to close the browser" in item:
+                    self.append_log(value)
+                    if "press Enter to close the browser" in value:
                         self.status_var.set("Review the filled forms, then click Finish Review")
         except queue.Empty:
             pass
@@ -1178,6 +1289,7 @@ class MarketingDashboard(tk.Tk):
         if self.process and self.process.poll() is not None:
             self.process = None
             self.status_var.set("Ready")
+            self.stop_button.pack_forget()
         self.after(250, self.poll_process_output)
 
     def finish_review(self):
