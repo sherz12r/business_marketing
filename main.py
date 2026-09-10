@@ -26,13 +26,16 @@ from urllib.parse import quote_plus
 from urllib.parse import urljoin, urlparse
 from playwright.sync_api import sync_playwright
 from dotenv import load_dotenv
+from google_results import GoogleResultsMixin
+from outreach_channels import OutreachChannelsMixin
 from app_paths import get_app_dir
 from progress_tracker import (
     EVENT_EMAIL_SENT,
     EVENT_FORM_PREFILLED,
     EVENT_WEBSITE_OPENED,
     EVENT_WHATSAPP_SENT,
-    ensure_progress_schema,
+    ensure_database,
+    outreach_stats,
     record_event,
 )
 
@@ -121,7 +124,7 @@ class SafePromptValues(dict):
         return "{" + str(key) + "}"
 
 
-class Automation:
+class Automation(GoogleResultsMixin, OutreachChannelsMixin):
     
     def write_log_header(self, title, width=70):
         self._log("=" * width)
@@ -136,7 +139,6 @@ class Automation:
         if sys.argv[0].endswith("dashboard.py"):
             return
 
-        from app_paths import get_app_dir
         from session_logger import append_log_line
 
         try:
@@ -146,7 +148,7 @@ class Automation:
             pass
 
     def __init__(self, mode="full"):
-        self.config = self.read_json('config.json')
+        self.config = self.read_json(str(Path(get_app_dir()) / 'config.json'))
         self.mode = mode
         
 
@@ -164,27 +166,34 @@ class Automation:
         )
         self.limit = max(1, int(self.config.get('limit', 10)))
         self.search_query = str(self.config.get('search_query', 'business near me')).strip()
-        self.data_dir = Path(self.config.get('data_dir', 'data'))
+        self.data_dir = Path(self.config.get('data_dir', 'data')).expanduser()
+        if not self.data_dir.is_absolute():
+            self.data_dir = Path(get_app_dir()) / self.data_dir
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.db = sqlite3.connect(self.data_dir / 'outreach.sqlite3')
-        self.db.execute('''CREATE TABLE IF NOT EXISTS outreach (
-            business_key TEXT PRIMARY KEY, business_name TEXT, website TEXT,
-            contact_page TEXT, emails TEXT, phones TEXT, proposal TEXT,
-            form_prefilled INTEGER DEFAULT 0, status TEXT, updated_at TEXT
-        )''')
-        ensure_progress_schema(self.db)
+        self.db.row_factory = sqlite3.Row
+        ensure_database(self.db)
+        self.run_id = self.db.execute(
+            "INSERT INTO outreach_runs(mode,search_query,target,started_at,status,pid) VALUES (?,?,?,?,?,?)",
+            (mode, self.search_query, self.limit, datetime.now().isoformat(timespec="seconds"), "running", os.getpid())
+        ).lastrowid
         self.db.commit()
         self.driver = None
         self.whatsapp_login_wait_used = False
 
         if self.mode == "pending-email":
-            self.process_pending_channel("email")
-            self.db.close()
+            try:
+                self.process_pending_channel("email")
+                self.finish_run("completed", "Pending email queue checked")
+            except Exception as exc:
+                self.finish_run("failed", str(exc))
+                raise
+            finally:
+                self.db.close()
             return
 
         browser_mode = "headless (no window)" if self.headless else "visible"
         self._log(f"Opening Chrome browser — {browser_mode}...")
-        from app_paths import get_app_dir
         configured_profile = Path(
             self.config.get("chrome_profile_dir", "chrome_profile")
         ).expanduser()
@@ -205,11 +214,18 @@ class Automation:
                 headless=self.headless
             )
 
+        self.driver.set_page_load_timeout(45)
         self._log("Browser ready.")
         self.iframe_found = False
         if self.mode == "pending-whatsapp":
-            self.process_pending_channel("whatsapp")
-            self._close_browser_safely()
+            try:
+                self.process_pending_channel("whatsapp")
+                self.finish_run("completed", "Pending WhatsApp queue checked")
+            except Exception as exc:
+                self.finish_run("failed", str(exc))
+                raise
+            finally:
+                self._close_browser_safely()
         else:
             self.start_automation()
 
@@ -218,7 +234,7 @@ class Automation:
         event_type = EVENT_WHATSAPP_SENT if channel == "whatsapp" else EVENT_EMAIL_SENT
         rows = self.db.execute(
             """SELECT o.*,
-                      (o.status IN ('sent', 'submitted', 'email_sent', 'fallback_sent')
+                      (o.status IN ('email_sent', 'fallback_sent')
                        OR EXISTS(SELECT 1 FROM outreach_events e
                              WHERE e.business_key = o.business_key
                                AND e.event_type = ?)) AS email_sent,
@@ -233,7 +249,7 @@ class Automation:
                        AND pending.event_type = ?)
                 AND (CASE WHEN ? = ?
                           THEN o.status NOT IN ('whatsapp_sent', 'fallback_sent')
-                          ELSE o.status NOT IN ('sent', 'submitted', 'email_sent', 'fallback_sent')
+                          ELSE o.status NOT IN ('email_sent', 'fallback_sent')
                      END)
               ORDER BY COALESCE(o.updated_at, '') ASC""",
             (
@@ -243,7 +259,7 @@ class Automation:
         ).fetchall()
 
         self._log(f"Found {len(rows)} pending {channel} draft(s).")
-        section = self.config.get(channel, {})
+        section = self.config.setdefault(channel, {})
         if isinstance(section, dict):
             section["auto_send"] = True
 
@@ -258,19 +274,23 @@ class Automation:
                 "proposal": row[6] or "",
                 "form_prefilled": bool(row[7]),
                 "status": row[8] or "draft_ready",
-                "email_sent": bool(row[10]),
-                "whatsapp_sent": bool(row[11]),
+                "email_sent": bool(row["email_sent"]),
+                "whatsapp_sent": bool(row["whatsapp_sent"]),
+                "whatsapp_phones": self.parse_stored_list(row["whatsapp_phones"]),
+                "run_id": self.run_id,
             }
             business_key = row[0]
+            self.register_candidate(business_key, {'name': result['name'], 'url': result['website']})
             self._log(
                 f"[{index}/{len(rows)}] Sending pending {channel} for "
                 f"{result['name'] or result['website'] or business_key}."
             )
-            sent = (
-                self.send_whatsapp_message(result, business_key)
-                if channel == "whatsapp"
-                else self.send_email_message(result, business_key)
-            )
+            try:
+                sent = getattr(self, f'send_{channel}_message')(result, business_key)
+            except Exception as exc:
+                sent = self.channel_outcome(result, channel, 'failed', str(exc))
+            self.db.execute('UPDATE run_businesses SET processed=1,status=? WHERE run_id=? AND business_key=?',
+                            ('sent' if sent else 'error', self.run_id, business_key))
             self.update_result_status(result)
             self.save_outreach(business_key, result)
             sent_count += int(sent)
@@ -393,531 +413,36 @@ class Automation:
     # START AUTOMATION
     # =========================================================
 
+    def finish_run(self, status, reason):
+        self.db.execute("UPDATE outreach_runs SET status=?,stop_reason=?,finished_at=? WHERE id=?",
+                        (status, reason, datetime.now().isoformat(timespec="seconds"), self.run_id))
+        self.db.commit()
+
     def start_automation(self):
         self._log("Automation run started.")
-
-        # Open Google and search
-        google_page = self.search_business()
-
-        if google_page is None:
-            self._log("Could not open Google.")
-            return
-
-        # Process websites
-        results = self.process_all_websites(
-            google_page,
-            limit=self.limit
-        )
-
-        self._log(
-            f"Automation completed. "
-            f"Total websites processed: {len(results)}"
-        )
-
-        if (
-            not self.headless
-            and any(item.get("form_prefilled") for item in results)
-        ):
-            input(
-                "Review the prefilled contact-form tabs. Submit only where appropriate, "
-                "then press Enter to close the browser..."
-            )
-
-        # Debug pause if you want
-        # input("Press Enter to close browser...")
-
-        self._close_browser_safely()
-
-    # =========================================================
-    # SEARCH BUSINESS ON GOOGLE
-    # =========================================================
-
-    # def search_business(self):
-
-    #     self._log("Searching business...")
-
-    #     self.random_sleep()
-
-    #     self.wait = WebDriverWait(
-    #         self.driver,
-    #         30
-    #     )
-
-    #     try:
-
-    #         google_url = (
-    #             "https://www.google.com/search?q=business+near+me&sca_esv=32b8bdd6e2d39944&hl=en&udm=1&lsack=Vjl3auavCsLj7_UPgdyI2AE&sa=X&ved=2ahUKEwjmsoy1m5GWAxXC8bsIHQEuAhsQjGp6BAguEAA&biw=1904&bih=380&dpr=1"
-    #         )
-
-    #         self.driver.get(google_url)
-
-    #         self._log(
-    #             "Google search page opened successfully."
-    #         )
-    #         # Wait for Google results
-    #         try:
-
-    #             self.wait.until(
-    #                 EC.presence_of_element_located(
-    #                     (By.TAG_NAME, "body")
-    #                 )
-    #             )
-
-    #         except TimeoutException:
-
-    #             self._log(
-    #                 "Google page loaded but body was not found."
-    #             )
-
-    #         return self.driver
-
-    #     except Exception as e:
-
-    #         self._log(
-    #             f"Error opening Google: {e}"
-    #         )
-
-    #         return None
-
-    def search_business(self):
-
-        self._log("Searching business...")
-
-        self.random_sleep()
-
-        self.wait = WebDriverWait(
-            self.driver,
-            30
-        )
-
         try:
-
-            google_url = "https://www.google.com/search?q=" + quote_plus(self.search_query)
-
-            self._log(
-                f"Opening Google: {google_url}"
-            )
-
-            self.driver.get(google_url)
-
-            # Wait until page body exists
-            self.wait.until(
-                EC.presence_of_element_located(
-                    (By.TAG_NAME, "body")
-                )
-            )
-
-            self._log(
-                "Google search page opened successfully."
-            )
-
-            # Google's initial local pack commonly contains only three cards.
-            # Open the expanded places list when the requested limit needs more.
-            if self.limit > 3:
-                for xpath in [
-                    "//a[contains(., 'More places')]",
-                    "//a[contains(., 'More businesses')]",
-                    "//*[@role='button'][contains(., 'More places')]",
-                    "//*[@role='button'][contains(., 'More businesses')]",
-                    "//a[contains(@aria-label, 'More places')]",
-                    "//a[contains(@aria-label, 'More businesses')]",
-                    "//a[contains(@href, 'tbm=lcl')]",
-                ]:
-                    try:
-                        more = self.driver.find_element(By.XPATH, xpath)
-                        if more.is_displayed():
-                            self.driver.execute_script("arguments[0].click();", more)
-                            self._log("Opened expanded Google business results.")
-                            WebDriverWait(self.driver, 20).until(
-                                EC.presence_of_element_located((By.TAG_NAME, "body"))
-                            )
-                            self.random_sleep()
-                            break
-                    except Exception:
-                        continue
-
-            # Give Google a little time to render
-            self.random_sleep()
-
-            return self.driver
-
-        except TimeoutException:
-
-            self._log(
-                "Google page loaded but body was not found."
-            )
-
-            return None
-
-        except Exception as e:
-
-            self._log(
-                f"Error opening Google: {type(e).__name__}: {e}"
-            )
-
-            return None
-
-
-    def get_google_websites(self, page):
-
-        self._log(
-            "Finding business website links from Google..."
-        )
-
-        if page is None:
-
-            self._log(
-                "Google page is None."
-            )
-
-            return []
-
-        websites = []
-        seen = set()
-
-        try:
-
-            # =====================================================
-            # METHOD 1
-            # New Google local/business results
-            #
-            # Google now creates:
-            #
-            # /goto?url=XXXXXXXX
-            #
-            # instead of directly giving:
-            #
-            # https://example.com
-            # =====================================================
-
-            # Scroll result panels/page to load additional businesses toward
-            # the configured maximum before extracting links and cards.
-            previous_card_count = 0
-            for _ in range(8):
-                cards = page.find_elements(By.CSS_SELECTOR, "div.w7Dbne, div.Nv2PK")
-                if len(cards) >= self.limit * 2 or (
-                    previous_card_count and len(cards) == previous_card_count
-                ):
-                    break
-                previous_card_count = len(cards)
-                page.execute_script(
-                    "const p=document.querySelector('[role=feed]');"
-                    "if(p){p.scrollTop=p.scrollHeight}else{window.scrollTo(0,document.body.scrollHeight)}"
-                )
-                sleep(1.2)
-
-            website_links = page.find_elements(
-                By.XPATH,
-                "//a[.//span[normalize-space()='Website']]"
-            )
-
-            self._log(
-                f"Found {len(website_links)} Google Website buttons."
-            )
-
-            for link in website_links:
-
+            google_page = self.search_business()
+            if google_page is None:
+                raise RuntimeError("Could not open Google")
+            results = self.process_all_websites(google_page, limit=self.limit)
+            _, run = outreach_stats(self.db)
+            self._log(f"Run finished: {run.get('found', 0)} found, {run.get('new', 0)} new, "
+                      f"{run.get('already_contacted', 0)} already contacted, {run.get('processed', 0)} processed, "
+                      f"{run.get('whatsapp', 0)} WhatsApp sent, {run.get('emails', 0)} emails sent. "
+                      f"{run.get('stop_reason', '')}")
+            if (not self.headless and self.config.get('review_mode', True)
+                    and self.config.get('keep_prefilled_tabs_open', True)
+                    and any(item.get('form_prefilled') for item in results)):
                 try:
+                    input("Review the prefilled contact-form tabs, then press Enter to close the browser...")
+                except EOFError:
+                    self._log("No interactive input available; closing review tabs.")
+        except Exception as exc:
+            self.finish_run('failed', str(exc))
+            raise
+        finally:
+            self._close_browser_safely()
 
-                    href = link.get_attribute("href")
-
-                    if not href:
-                        continue
-
-                    # Convert relative URL to absolute Google URL
-                    if href.startswith("/"):
-                        href = urljoin(
-                            self.driver.current_url,
-                            href
-                        )
-
-                    self._log(
-                        f"Google Website link: {href}"
-                    )
-
-                    # =================================================
-                    # New Google /goto link
-                    # =================================================
-
-                    if "/goto?" in href:
-
-                        website_url = self.resolve_google_website(
-                            href
-                        )
-
-                    else:
-
-                        # Old/direct format
-                        website_url = href
-
-                    if not website_url:
-                        self._log(
-                            "Could not resolve website URL."
-                        )
-                        continue
-
-                    website_url = website_url.strip()
-
-                    if not website_url.startswith(
-                        ("http://", "https://")
-                    ):
-                        continue
-
-                    if self.is_ignored_url(website_url):
-                        self._log(f"Ignoring configured URL: {website_url}")
-                        continue
-
-                    # Parse domain
-                    parsed = urlparse(website_url)
-
-                    domain = parsed.netloc.lower()
-
-                    # Remove www
-                    if domain.startswith("www."):
-                        domain = domain[4:]
-
-                    # Ignore Google
-                    if (
-                        "google.com" in domain
-                        or "google.ae" in domain
-                        or "googleusercontent.com" in domain
-                    ):
-                        continue
-
-                    # Remove duplicate domains
-                    if domain in seen:
-                        continue
-
-                    seen.add(domain)
-
-                    # Try to get business name
-                    name = ""
-
-                    try:
-
-                        parent = link.find_element(
-                            By.XPATH,
-                            "./ancestor::div[contains(@class,'w7Dbne')][1]"
-                        )
-
-                        name_element = parent.find_element(
-                            By.CSS_SELECTOR,
-                            ".dbg0pd .OSrXXb"
-                        )
-
-                        name = name_element.text.strip()
-
-                    except Exception:
-                        pass
-
-                    websites.append({
-                        "name": name,
-                        "url": website_url
-                    })
-
-                    self._log(
-                        f"Website found: {name} -> {website_url}"
-                    )
-
-                except Exception as e:
-
-                    self._log(
-                        f"Error reading Website button: {e}"
-                    )
-
-            # =====================================================
-            # METHOD 2
-            # Fallback for older Google result format
-            # =====================================================
-
-            if not websites:
-
-                self._log(
-                    "No new-style Website buttons found."
-                )
-
-                self._log(
-                    "Trying fallback method for older Google results..."
-                )
-
-                links = page.find_elements(
-                    By.CSS_SELECTOR,
-                    "a[href]"
-                )
-
-                self._log(
-                    f"Google returned {len(links)} links."
-                )
-
-                for link in links:
-
-                    try:
-
-                        href = link.get_attribute("href")
-
-                        if not href:
-                            continue
-
-                        # Direct HTTP links
-                        if not href.startswith(
-                            ("http://", "https://")
-                        ):
-                            continue
-
-                        if self.is_ignored_url(href):
-                            self._log(f"Ignoring configured URL: {href}")
-                            continue
-
-                        parsed = urlparse(href)
-
-                        domain = parsed.netloc.lower()
-
-                        if domain.startswith("www."):
-                            domain = domain[4:]
-
-                        # Ignore Google
-                        if (
-                            "google.com" in domain
-                            or "google.ae" in domain
-                            or "googleusercontent.com" in domain
-                        ):
-                            continue
-
-                        # Ignore Maps
-                        if "google.com/maps" in href:
-                            continue
-
-                        if domain in seen:
-                            continue
-
-                        seen.add(domain)
-
-                        websites.append({
-                            "name": "",
-                            "url": href
-                        })
-
-                    except Exception as e:
-
-                        self._log(
-                            f"Fallback link error: {e}"
-                        )
-
-            self._log(
-                f"Found {len(websites)} unique websites."
-            )
-
-            # Include visible Google business cards that have no website.
-            # These can still be drafted for review when Google exposes a phone.
-            known_names = {item.get("name", "").strip().lower() for item in websites}
-            for card in page.find_elements(By.CSS_SELECTOR, "div.w7Dbne, div.Nv2PK"):
-                try:
-                    name_nodes = card.find_elements(By.CSS_SELECTOR, ".dbg0pd .OSrXXb, .qBF1Pd")
-                    name = name_nodes[0].text.strip() if name_nodes else ""
-                    if not name or name.lower() in known_names:
-                        continue
-                    text = card.text
-                    phones = self.extract_phone_numbers(text)
-                    websites.append({"name": name, "url": "", "phones": phones})
-                    known_names.add(name.lower())
-                except Exception:
-                    continue
-
-            return websites
-
-        except Exception as e:
-
-            self._log(
-                f"Error finding Google websites: "
-                f"{type(e).__name__}: {e}"
-            )
-
-            return []
-
-    # =========================================================
-    # OPEN WEBSITE
-    # =========================================================
-
-    # def open_website(self, website):
-
-    #     """
-    #     Opens a website in a NEW browser tab.
-    #     """
-
-    #     url = website.get(
-    #         "url",
-    #         ""
-    #     )
-
-    #     if not url:
-
-    #         self._log(
-    #             "Website URL is empty."
-    #         )
-
-    #         return None
-
-    #     self._log(
-    #         f"Opening website: {url}"
-    #     )
-
-    #     try:
-
-    #         # Save current tab
-    #         original_window = self.driver.current_window_handle
-
-    #         # Selenium 4:
-    #         # Open a new tab
-    #         self.driver.switch_to.new_window(
-    #             "tab"
-    #         )
-
-    #         # Open website
-    #         self.driver.get(url)
-
-    #         # Wait for page
-    #         try:
-
-    #             WebDriverWait(
-    #                 self.driver,
-    #                 15
-    #             ).until(
-    #                 EC.presence_of_element_located(
-    #                     (By.TAG_NAME, "body")
-    #                 )
-    #             )
-
-    #         except TimeoutException:
-
-    #             self._log(
-    #                 f"Page body timeout: {url}"
-    #             )
-
-    #         # Small random delay
-    #         self.random_sleep()
-
-    #         return {
-    #             "window_handle": self.driver.current_window_handle,
-    #             "original_window": original_window
-    #         }
-
-    #     except Exception as e:
-
-    #         self._log(
-    #             f"Error opening {url}: {e}"
-    #         )
-
-    #         # Try to close current tab
-    #         try:
-    #             if len(self.driver.window_handles) > 1:
-    #                 self.driver.close()
-    #                 self.driver.switch_to.window(
-    #                     original_window
-    #                 )
-    #         except Exception:
-    #             pass
-
-    #         return None
 
     def open_website(self, website):
 
@@ -1333,12 +858,15 @@ class Automation:
             "website": url,
             "contact_page": "",
             "emails": [],
-            "phones": website.get("phones", []),
+            "phones": list(website.get("phones", [])),
             "proposal": "",
             "form_prefilled": False,
             "email_sent": False,
             "whatsapp_sent": False,
-            "status": "processing"
+            "status": "processing",
+            "run_id": getattr(self, "run_id", None),
+            "channel_status": {},
+            "whatsapp_phones": website.get("whatsapp_phones", [])
         }
 
         if url and self.is_ignored_url(url):
@@ -1366,6 +894,8 @@ class Automation:
                 self.append_draft(result)
             except Exception as exc:
                 result["status"] = "draft_error"
+                result["last_error"] = str(exc)
+                self.save_outreach(business_key, result)
                 self._log(f"Draft generation error: {exc}")
             return result
 
@@ -1375,7 +905,15 @@ class Automation:
         )
 
         if not tab_info:
-
+            result['last_error'] = 'Website could not be opened'
+            try:
+                result['proposal'] = self.generate_website_proposal(website) or ''
+            except Exception as exc:
+                self._log(f'Proposal error: {exc}')
+            self.run_fallback_channels(result, business_key, reason='website unavailable')
+            self.update_result_status(result)
+            result['status'] = 'website_error'
+            self.save_outreach(business_key, result)
             return result
 
         try:
@@ -1424,11 +962,12 @@ class Automation:
                 self.driver
             )
 
+            result["whatsapp_phones"] = whatsapp_numbers
             result["emails"] = emails
 
             result["phones"] = sorted(
                 set(
-                    phones
+                    result["phones"] + phones
                     + whatsapp_numbers
                 )
             )
@@ -1514,6 +1053,8 @@ class Automation:
                             + contact_emails
                         )
                     )
+
+                    result["whatsapp_phones"] = list(dict.fromkeys(result["whatsapp_phones"] + contact_whatsapp_numbers))
 
                     # Merge phones
                     result["phones"] = sorted(
@@ -1625,11 +1166,7 @@ class Automation:
                     # merely fallbacks for websites without a contact form.
                     # Attempt both after preparing the proposal regardless of
                     # whether a form was also filled successfully.
-                    self.run_fallback_channels(
-                        result,
-                        business_key,
-                        reason="proposal ready"
-                    )
+
 
                 else:
 
@@ -1646,6 +1183,8 @@ class Automation:
             # -----------------------------------------
             # FINAL RESULT
             # -----------------------------------------
+
+            self.run_fallback_channels(result, business_key, reason="website checked")
 
             if (
                 result["emails"]
@@ -1668,10 +1207,11 @@ class Automation:
 
         except Exception as e:
 
-            self._log(
-                f"Website processing error: {e}"
-            )
-
+            self._log(f"Website processing error: {e}")
+            result['status'] = 'error'
+            result['last_error'] = str(e)
+            self.run_fallback_channels(result, business_key, reason='website processing error')
+            self.save_outreach(business_key, result)
             return result
 
         finally:
@@ -1729,156 +1269,77 @@ class Automation:
     # PROCESS ALL WEBSITES
     # =========================================================
 
-    def go_to_next_google_page(self):
-        """Open Google's next result page and wait until it is ready."""
-        current_url = self.driver.current_url
 
-        selectors = [
-            (By.ID, "pnnext"),
-            (By.CSS_SELECTOR, "a[aria-label='Next page']"),
-            (By.CSS_SELECTOR, "a[aria-label='Next']"),
-            (By.XPATH, "//a[.//span[normalize-space()='Next']]"),
-        ]
+    def register_candidate(self, key, website):
+        row = self.db.execute("SELECT status FROM outreach WHERE business_key=?", (key,)).fetchone()
+        contacted = bool(self.db.execute("SELECT 1 FROM outreach_events WHERE business_key=? AND event_type IN (?,?) LIMIT 1",
+                         (key, EVENT_EMAIL_SENT, EVENT_WHATSAPP_SENT)).fetchone()) or bool(row and row[0] in {'email_sent','whatsapp_sent','fallback_sent','submitted','sent'})
+        self.db.execute("INSERT OR IGNORE INTO run_businesses(run_id,business_key,is_new,already_contacted) VALUES(?,?,?,?)",
+                        (self.run_id, key, int(not row), int(contacted)))
+        self.db.execute("INSERT OR IGNORE INTO outreach(business_key,business_name,website,phones,status) VALUES(?,?,?,?,?)",
+                        (key, website.get('name',''), website.get('url',''), json.dumps(website.get('phones',[])), 'discovered'))
+        self.db.commit()
 
-        next_link = None
-        for by, selector in selectors:
-            try:
-                candidate = self.driver.find_element(by, selector)
-                if candidate.is_displayed():
-                    next_link = candidate
-                    break
-            except Exception:
-                continue
-
-        if next_link is None:
-            self._log("No next Google results page was found.")
-            return False
-
-        try:
-            next_url = next_link.get_attribute("href")
-            if next_url:
-                self.driver.get(next_url)
-            else:
-                self.driver.execute_script("arguments[0].click();", next_link)
-
-            WebDriverWait(self.driver, 20).until(
-                lambda driver: driver.current_url != current_url
-            )
-            WebDriverWait(self.driver, 20).until(
-                EC.presence_of_element_located((By.TAG_NAME, "body"))
-            )
-            self.random_sleep()
-            return True
-        except Exception as e:
-            self._log(f"Could not open the next Google results page: {e}")
-            return False
-
-    def process_all_websites(
-        self,
-        google_page,
-        limit=20
-    ):
-
-        self._log(
-            "PROCESSING GOOGLE RESULTS"
-        )
-
-        results = []
-        seen_candidates = set()
-        page_number = 1
-        max_pages = max(1, int(self.config.get("google_max_pages", 20)))
-
-        while page_number <= max_pages:
-            completed = sum(
-                1 for item in results
-                if item.get("status") not in {"skipped_duplicate", "ignored_url"}
-            )
-            if completed >= limit:
+    def process_all_websites(self, google_page, limit=20):
+        results, seen_candidates, seen_pages = [], set(), set()
+        processed = 0
+        reason, run_status = 'Google page limit reached', 'completed'
+        google_window = self.driver.current_window_handle
+        max_pages = max(1, int(self.config.get('google_max_pages', 20)))
+        for page_number in range(1, max_pages + 1):
+            self.driver.switch_to.window(google_window)
+            if self.google_is_blocked():
+                reason, run_status = 'Google requires consent or CAPTCHA; resolve it in the browser and run again', 'blocked'
                 break
-
-            self._log(f"Reading Google results page {page_number}...")
             websites = self.get_google_websites(google_page)
-            self._log(
-                f"Page {page_number} has {len(websites)} candidates; "
-                f"{completed}/{limit} new businesses completed."
-            )
-
-            # A normal Google web-results page can still have a generic Next
-            # link even though it contains no local business cards. Do not
-            # follow that pagination blindly.
-            if not websites:
-                self._log(
-                    f"Google page {page_number} contains no business candidates; "
-                    "stopping instead of advancing blindly."
-                )
+            fingerprint = tuple(sorted(self.business_key(site) for site in websites))
+            # Empty pages can have a valid next page. Nonempty repeated pages cannot add work.
+            if fingerprint and fingerprint in seen_pages:
+                reason = 'Google returned a repeated results page'
                 break
-
-            page_candidates_checked = 0
-            for index, website in enumerate(websites, start=1):
-                completed = sum(
-                    1 for item in results
-                    if item.get("status") not in {"skipped_duplicate", "ignored_url"}
-                )
-                if completed >= limit:
-                    break
-
-                candidate_key = self.business_key(website)
-                if candidate_key in seen_candidates:
-                    page_candidates_checked += 1
+            seen_pages.add(fingerprint)
+            self.db.execute('UPDATE outreach_runs SET pages=? WHERE id=?', (page_number, self.run_id))
+            self.db.commit()
+            self._log(f'Google page {page_number}: {len(websites)} candidates; {processed}/{limit} processed.')
+            for website in websites:
+                # Stable saved names let a previously phone-only listing retain its history.
+                matching = self.db.execute("SELECT business_key FROM outreach WHERE lower(business_name)=? AND (website IS NULL OR website='') LIMIT 1",
+                                           ((website.get('name') or '').strip().lower(),)).fetchone()
+                key = matching[0] if matching else self.business_key(website)
+                if key in seen_candidates:
                     continue
-                seen_candidates.add(candidate_key)
-
-                url = website.get("url", "")
-                self._log(
-                    f"[page {page_number}; candidate {index}/{len(websites)}; "
-                    f"new {completed}/{limit}] {url}"
-                )
-
+                seen_candidates.add(key)
+                website['_business_key'] = key
+                self.register_candidate(key, website)
+                if processed >= limit:
+                    continue
                 try:
+                    if not self.was_previously_processed(key):
+                        website = self.enrich_google_business(website)
                     result = self.process_website(website)
-                    self._log(result)
-                    results.append(result)
-                except Exception as e:
-                    self._log(f"Error processing {url}: {e}")
-                    results.append({
-                        "name": website.get("name", ""),
-                        "website": url,
-                        "contact_page": "",
-                        "emails": [],
-                        "phones": [],
-                        "status": "error",
-                    })
-                finally:
-                    page_candidates_checked += 1
-
-            completed = sum(
-                1 for item in results
-                if item.get("status") not in {"skipped_duplicate", "ignored_url"}
-            )
-            if completed >= limit:
+                except Exception as exc:
+                    result = dict(name=website.get('name',''), website=website.get('url',''),
+                                  phones=website.get('phones',[]), status='error', last_error=str(exc), run_id=self.run_id)
+                    self.save_outreach(key, result)
+                    self._log(f"Business processing failed; continuing: {exc}")
+                checked = result.get('status') not in {'skipped_duplicate','ignored_url'}
+                processed += int(checked)
+                self.db.execute('UPDATE run_businesses SET processed=?, status=? WHERE run_id=? AND business_key=?',
+                                (int(checked), result.get('status','error'), self.run_id, key))
+                self.db.commit()
+                results.append(result)
+                self.driver.switch_to.window(google_window)
+            if processed >= limit:
+                reason = 'Configured business limit reached'
                 break
-
-            if page_candidates_checked < len(websites):
-                self._log(
-                    f"Only checked {page_candidates_checked}/{len(websites)} candidates "
-                    f"on Google page {page_number}; not advancing."
-                )
+            if page_number == max_pages:
                 break
-
-            self._log(
-                f"Checked all {page_candidates_checked} business candidates on "
-                f"Google page {page_number}."
-            )
             if not self.go_to_next_google_page():
+                reason = 'No next Google page or additional business results'
                 break
-            page_number += 1
-
-        self._log(
-            f"Finished processing "
-            f"{len(results)} websites"
-        )
-
+        self.finish_run(run_status, reason)
         return results
+
 
     def resolve_google_website(self, google_url):
 
@@ -2787,27 +2248,11 @@ class Automation:
                 )
                 continue
 
-            if len(digits) >= 10:
+            if 10 <= len(digits) <= 15:
                 return digits
 
         return ""
 
-    def run_fallback_channels(self, result, business_key, reason=""):
-        self._log(
-            f"Fallback outreach check started: {reason}"
-        )
-
-        whatsapp_sent = self.send_whatsapp_message(
-            result,
-            business_key
-        )
-
-        email_sent = self.send_email_message(
-            result,
-            business_key
-        )
-
-        return whatsapp_sent or email_sent
 
     def channel_image_path(self, section):
         if not self.get_bool_setting(section, "send_image", default=False):
@@ -2832,16 +2277,15 @@ class Automation:
         elif result.get("whatsapp_sent"):
             result["status"] = "whatsapp_sent"
         else:
-            result["status"] = "draft_ready"
+            result["status"] = "draft_ready" if result.get('proposal') else "draft_error"
 
-    def send_whatsapp_message(self, result, business_key):
+    def _send_whatsapp_to_phone(self, result, business_key):
         if not self.get_bool_setting(
             "whatsapp",
             "enabled",
             default=True
         ):
-            self._log("WhatsApp fallback disabled.")
-            return False
+            return self.channel_outcome(result, "whatsapp", "disabled", "Disabled in settings")
 
         message = (
             self.channel_message(
@@ -2858,16 +2302,13 @@ class Automation:
         )
 
         if not phone:
-            self._log("WhatsApp fallback skipped: no usable phone number.")
-            return False
+            return self.channel_outcome(result, "whatsapp", "no_phone", "No usable phone number")
 
         if not message and not image_path:
-            self._log("WhatsApp fallback skipped: proposal message is empty.")
-            return False
+            return self.channel_outcome(result, "whatsapp", "no_message", "No proposal or image available")
 
         if send_image and not image_path:
-            self._log("WhatsApp image send skipped: select a valid image file.")
-            return False
+            return self.channel_outcome(result, "whatsapp", "configuration_missing", "Select a valid image file")
 
         auto_send = self.get_bool_setting(
             "whatsapp",
@@ -2882,8 +2323,7 @@ class Automation:
         )
 
         if not auto_send and not open_for_review:
-            self._log("WhatsApp fallback ready, but auto_send is off.")
-            return False
+            return self.channel_outcome(result, "whatsapp", "review", "Auto send is off")
 
         # Enabling WhatsApp images always sends the image by itself. The AI
         # proposal remains available for forms/email but is not sent as a
@@ -2895,8 +2335,8 @@ class Automation:
 
         original_window = None
         whatsapp_window = None
-        send_timeout = max(5, int(self.get_section_setting(
-            "whatsapp", "send_timeout_seconds", default=10
+        send_timeout = max(30, int(self.get_section_setting(
+            "whatsapp", "send_timeout_seconds", default=30
         )))
         login_timeout = max(10, int(self.get_section_setting(
             "whatsapp", "login_timeout_seconds", default=180
@@ -2930,42 +2370,43 @@ class Automation:
 
             if image_path:
                 if not self.upload_whatsapp_image(image_path, timeout=button_timeout):
-                    return False
+                    return self.channel_outcome(result, 'whatsapp', 'failed', 'Image upload failed')
                 self._log(f"WhatsApp image attached: {image_path.name}")
 
             if not auto_send:
-                self._log("WhatsApp content left open for review; auto_send is off.")
-                return False
+                return self.channel_outcome(result, 'whatsapp', 'review', 'Content opened for review; auto send is off')
 
             send_button = self.find_whatsapp_send_button(timeout=button_timeout)
 
             if not send_button:
-                self._log(
-                    "WhatsApp send button not found. Log in to WhatsApp Web "
-                    "or review the opened tab."
-                )
-                return False
+                self.whatsapp_login_wait_used = True
+                return self.channel_outcome(result, 'whatsapp', 'failed', 'Chat not ready, number unavailable, or WhatsApp login required')
 
             self.whatsapp_login_wait_used = True
+            previous_ids = self.whatsapp_outgoing_ids()
             send_button.click()
+            result['_whatsapp_send_clicked'] = True
+            if not self.wait_for_whatsapp_confirmation(previous_ids, send_timeout):
+                record_event(self.db, 'whatsapp_uncertain', business_key, result,
+                             details='Send clicked but no new sent message was confirmed', recipient=phone)
+                return self.channel_outcome(result, 'whatsapp', 'uncertain', 'Send clicked; confirmation timed out. Review the chat before retrying')
             message_sent = True
-            self.random_sleep()
             result["whatsapp_sent"] = True
             record_event(
                 self.db,
                 EVENT_WHATSAPP_SENT,
                 business_key,
                 result,
-                details="WhatsApp image sent" if image_path else "WhatsApp message sent by fallback"
+                details="WhatsApp image sent" if image_path else "WhatsApp message confirmed sent",
+                recipient=phone
             )
             self._log("WhatsApp image sent." if image_path else "WhatsApp message sent.")
             return True
 
         except Exception as e:
-            self._log(
-                f"WhatsApp fallback error: {e}"
-            )
-            return False
+            if result.get('_whatsapp_send_clicked'):
+                record_event(self.db, 'whatsapp_uncertain', business_key, result, details=str(e), recipient=phone)
+            return self.channel_outcome(result, 'whatsapp', 'failed', str(e))
 
         finally:
             keep_tab_open = self.get_bool_setting(
@@ -2979,7 +2420,7 @@ class Automation:
                     whatsapp_window
                     and whatsapp_window in self.driver.window_handles
                     and not keep_tab_open
-                    and message_sent
+                    and (message_sent or (auto_send and not result.get('_whatsapp_send_clicked')))
                 ):
                     self.driver.switch_to.window(
                         whatsapp_window
@@ -3075,14 +2516,13 @@ class Automation:
 
         return emails
 
-    def send_email_message(self, result, business_key):
+    def _send_email_message(self, result, business_key):
         if not self.get_bool_setting(
             "email",
             "enabled",
             default=True
         ):
-            self._log("Email fallback disabled.")
-            return False
+            return self.channel_outcome(result, "email", "disabled", "Disabled in settings")
 
         auto_send = self.get_bool_setting(
             "email",
@@ -3090,13 +2530,10 @@ class Automation:
             default=False
         )
 
-        recipients = self.email_recipients(
-            result
-        )
+        recipients = result.get('_email_recipients', self.email_recipients(result))
 
         if not recipients:
-            self._log("Email fallback skipped: no email address found.")
-            return False
+            return self.channel_outcome(result, "email", "no_email", "No email address found")
 
         message = (
             self.channel_message(
@@ -3109,17 +2546,12 @@ class Automation:
         image_only = self.get_bool_setting("email", "image_only", default=False)
 
         if not message and not image_path:
-            self._log("Email fallback skipped: proposal message is empty.")
-            return False
+            return self.channel_outcome(result, "email", "no_message", "No proposal or image available")
         if image_only and not image_path:
-            self._log("Email image-only send skipped: select a valid image file.")
-            return False
+            return self.channel_outcome(result, "email", "configuration_missing", "Select a valid image file")
 
         if not auto_send:
-            self._log(
-                "Email fallback ready, but auto_send is off."
-            )
-            return False
+            return self.channel_outcome(result, 'email', 'review', 'Auto send is off')
 
         smtp_host = self.get_section_setting(
             "email",
@@ -3166,10 +2598,7 @@ class Automation:
         )
 
         if not smtp_host or not from_email:
-            self._log(
-                "Email fallback skipped: smtp_host and from_email are required."
-            )
-            return False
+            return self.channel_outcome(result, 'email', 'configuration_missing', 'SMTP host and sender email are required')
 
         email = EmailMessage()
         email["Subject"] = str(subject)
@@ -3230,28 +2659,19 @@ class Automation:
                         smtp_password
                     )
 
-                server.send_message(
-                    email
-                )
+                refused = server.send_message(email) or {}
 
-            result["email_sent"] = True
-            record_event(
-                self.db,
-                EVENT_EMAIL_SENT,
-                business_key,
-                result,
-                details=("Email image sent to " if image_path else "Email sent to ") + ", ".join(recipients)
-            )
-            self._log(
-                f"Email sent to {', '.join(recipients)}."
-            )
-            return True
+            accepted = [address for address in recipients if address not in refused]
+            for address in accepted:
+                record_event(self.db, EVENT_EMAIL_SENT, business_key, result,
+                             details='SMTP accepted message', recipient=address.lower())
+            result['email_sent'] = bool(accepted)
+            self.channel_outcome(result, 'email', 'partial_sent' if refused else 'sent',
+                                 f'{len(accepted)} accepted by SMTP; {len(refused)} refused')
+            return bool(accepted)
 
         except Exception as e:
-            self._log(
-                f"Email fallback error: {e}"
-            )
-            return False
+            return self.channel_outcome(result, 'email', 'failed', str(e))
 
 
     def is_ignored_url(self, url):
@@ -3294,6 +2714,8 @@ class Automation:
 
     def business_key(self, website):
         """Return a stable domain/name key for deduplication."""
+        if website.get("_business_key"):
+            return website["_business_key"]
         url = website.get("url", "").strip().lower()
         name = website.get("name", "").strip().lower()
         parsed = urlparse(url) if url else None
@@ -3307,9 +2729,9 @@ class Automation:
             return False
 
         row = self.db.execute(
-            "SELECT updated_at FROM outreach WHERE business_key = ?", (business_key,)
+            "SELECT updated_at, status FROM outreach WHERE business_key = ?", (business_key,)
         ).fetchone()
-        if not row:
+        if not row or row[1] in {"discovered", "error", "website_error", "draft_error", "processing"}:
             return False
 
         cooldown_days = max(1, int(self.config.get("reprocess_after_days", 40)))
@@ -3350,6 +2772,9 @@ class Automation:
                 datetime.now().isoformat(timespec="seconds")
             )
         )
+        self.db.execute('UPDATE outreach SET channel_status=?,whatsapp_phones=?,last_error=? WHERE business_key=?',
+                        (json.dumps(result.get('channel_status', {})), json.dumps(result.get('whatsapp_phones', [])),
+                         result.get('last_error',''), business_key))
         self.db.commit()
 
     def append_draft(self, result):
@@ -4087,6 +3512,7 @@ class Automation:
         )
 
         filled_count = 0
+        message_filled = False
 
         # =====================================================
         # NAME
@@ -4299,9 +3725,8 @@ class Automation:
 
                     filled_count += 1
 
-                    self._log(
-                        "Message field filled."
-                    )
+                    message_filled = True
+                    self._log("Message field filled.")
 
             else:
 
@@ -4323,7 +3748,7 @@ class Automation:
             f"Form fields filled: {filled_count}"
         )
 
-        if filled_count == 0:
+        if not message_filled:
 
             self._log(
                 "✗ Could not fill any form fields."

@@ -26,16 +26,27 @@
     </section>
 
     <section class="stats" aria-label="Outreach statistics">
-      <article><span>Leads</span><strong id="statLeads">0</strong></article>
-      <article><span>Websites</span><strong id="statWebsites">0</strong></article>
-      <article><span>Forms</span><strong id="statForms">0</strong></article>
-      <article><span>Emails</span><strong id="statEmails">0</strong></article>
-      <article><span>WhatsApp</span><strong id="statWhatsapp">0</strong></article>
+      <article><span>Businesses found ? Total</span><strong id="statLeads">0</strong></article>
+      <article><span>Contacted ? Total</span><strong id="statContacted">0</strong></article>
+      <article><span>Not contacted ? Total</span><strong id="statPending">0</strong></article>
+      <article><span>With contact details ? Total</span><strong id="statContacts">0</strong></article>
+      <article><span>Websites opened ? Total</span><strong id="statWebsites">0</strong></article>
+      <article><span>Forms filled ? Total</span><strong id="statForms">0</strong></article>
+      <article><span>Emails sent ? Total</span><strong id="statEmails">0</strong></article>
+      <article><span>WhatsApp sent ? Total</span><strong id="statWhatsapp">0</strong></article>
+    </section>
+
+    <section class="panel run-panel" aria-label="Latest run statistics">
+      <div class="panel-title"><h3>Latest run</h3><span id="runState">No recorded run yet</span></div>
+      <progress id="runProgress" max="100" value="0"></progress>
+      <p id="runSummary">Run automation to track new discoveries and outreach.</p>
+      <p id="runReason"></p>
+      <div class="run-counts" id="runCounts"></div>
     </section>
 
     <section class="grid">
       <article class="panel leads-panel">
-        <div class="panel-title"><div><p class="eyebrow">PIPELINE</p><h3>Recent leads</h3></div><input id="search" type="search" placeholder="Search leads…" aria-label="Search leads"></div>
+        <div class="panel-title"><div><p class="eyebrow">PIPELINE</p><h3>Recent leads</h3><p class="list-note">Latest 250 businesses; totals include all records.</p></div><input id="search" type="search" placeholder="Search leads…" aria-label="Search leads"></div>
         <div id="leadList" class="lead-list"><p class="empty">Loading leads…</p></div>
       </article>
       <article class="panel log-panel">

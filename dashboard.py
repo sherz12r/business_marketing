@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from contextlib import closing
 import os
 import queue
 import re
@@ -16,12 +17,14 @@ from urllib.parse import quote_plus, urlparse
 import tkinter as tk
 
 from app_paths import get_app_dir
+from process_utils import process_running
 from progress_tracker import (
     EVENT_EMAIL_SENT,
     EVENT_FORM_PREFILLED,
     EVENT_WEBSITE_OPENED,
     EVENT_WHATSAPP_SENT,
     ensure_database,
+    outreach_stats,
     record_event,
 )
 
@@ -98,6 +101,7 @@ DEFAULT_CONFIG = {
     "chatgpt_profile_dir": "chatgpt_profile",
     "search_query": "business near me",
     "limit": 10,
+    "google_max_pages": 20,
     "openai_model": "gpt-5.5",
     "data_dir": "data",
     "review_mode": True,
@@ -121,7 +125,7 @@ DEFAULT_CONFIG = {
         "include_contact_details": True,
         "open_for_review": True,
         "keep_tabs_open": False,
-        "send_timeout_seconds": 10,
+        "send_timeout_seconds": 30,
         "login_timeout_seconds": 180,
         "default_country_code": "971",
         "ignore_phone_prefixes": [],
@@ -155,6 +159,7 @@ SETTINGS_SECTIONS = [
         [
             {"path": ("search_query",), "label": "Search Query", "type": "text"},
             {"path": ("limit",), "label": "Lead Limit", "type": "int", "min": 1},
+            {"path": ("google_max_pages",), "label": "Google Page Limit", "type": "int", "min": 1},
             {"path": ("headless",), "label": "Headless Browser", "type": "bool"},
             {"path": ("review_mode",), "label": "Review Mode", "type": "bool"},
             {"path": ("keep_prefilled_tabs_open",), "label": "Keep Prefilled Tabs Open", "type": "bool"},
@@ -739,15 +744,21 @@ class MarketingDashboard(tk.Tk):
         stats = tk.Frame(parent, bg=COLORS["bg"])
         stats.pack(fill="x", pady=(0, 16))
         cards = [
-            ("websites_opened", "Websites Opened", COLORS["accent"]),
-            ("forms_prefilled", "Forms Filled", COLORS["good"]),
-            ("emails_sent", "Emails Sent", COLORS["accent_2"]),
-            ("whatsapp_sent", "WhatsApp Sent", COLORS["warning"]),
-            ("drafts_ready", "Drafts Ready", "#c084fc"),
-            ("contacts_found", "Contacts Found", "#fda4af"),
+            ("businesses", "Businesses Found ? Total", COLORS["accent"]),
+            ("contacted", "Contacted ? Total", COLORS["good"]),
+            ("pending", "Not Contacted ? Total", COLORS["warning"]),
+            ("websites", "Websites Opened ? Total", COLORS["accent"]),
+            ("forms", "Forms Filled ? Total", COLORS["good"]),
+            ("contacts", "With Contacts ? Total", COLORS["accent_2"]),
+            ("new", "New ? Latest Run", COLORS["accent"]),
+            ("already_contacted", "Already Contacted ? Run", COLORS["good"]),
+            ("skipped", "Skipped ? Latest Run", COLORS["warning"]),
+            ("failed", "Failed ? Latest Run", COLORS["danger"]),
+            ("emails", "Emails Sent ? Total", COLORS["accent_2"]),
+            ("whatsapp", "WhatsApp Sent ? Total", COLORS["warning"]),
         ]
         for index, (key, label, accent) in enumerate(cards):
-            stats.grid_columnconfigure(index, weight=1)
+            stats.grid_columnconfigure(index % 6, weight=1)
             card = tk.Frame(
                 stats,
                 bg=COLORS["panel"],
@@ -756,7 +767,7 @@ class MarketingDashboard(tk.Tk):
                 highlightthickness=1,
                 highlightbackground=COLORS["line"],
             )
-            card.grid(row=0, column=index, sticky="nsew", padx=(0 if index == 0 else 8, 0))
+            card.grid(row=index // 6, column=index % 6, sticky="nsew", padx=(0 if index % 6 == 0 else 8, 0), pady=(0, 8))
             value = tk.StringVar(value="0")
             self.stat_vars[key] = value
             tk.Label(card, text=label, bg=COLORS["panel"], fg=COLORS["muted"], font=("Segoe UI", 9, "bold")).pack(anchor="w")
@@ -856,7 +867,7 @@ class MarketingDashboard(tk.Tk):
         progress = self.card(side, row=1)
         tk.Label(progress, text="Run Progress", bg=COLORS["panel"], fg=COLORS["text"], font=("Segoe UI", 13, "bold")).pack(anchor="w")
         ttk.Progressbar(progress, variable=self.progress_value, maximum=100, style="Dashboard.Horizontal.TProgressbar").pack(fill="x", pady=(12, 8))
-        tk.Label(progress, textvariable=self.progress_text_var, bg=COLORS["panel"], fg=COLORS["muted"], font=("Segoe UI", 9)).pack(anchor="w")
+        tk.Label(progress, textvariable=self.progress_text_var, bg=COLORS["panel"], fg=COLORS["muted"], font=("Segoe UI", 9), wraplength=270, justify="left").pack(anchor="w")
 
         activity = self.card(side, row=2)
         tk.Label(activity, text="Recent Activity", bg=COLORS["panel"], fg=COLORS["text"], font=("Segoe UI", 13, "bold")).pack(anchor="w")
@@ -961,7 +972,7 @@ class MarketingDashboard(tk.Tk):
 
     def load_data(self):
         try:
-            with self.connect() as connection:
+            with closing(self.connect()) as connection:
                 raw_rows = self.fetch_rows(connection)
                 self.rows = [self.normalize_row(row) for row in raw_rows]
                 self.row_by_key = {row["business_key"]: row for row in self.rows}
@@ -1013,6 +1024,7 @@ class MarketingDashboard(tk.Tk):
             "proposal": proposal,
             "form_prefilled": bool(row["form_prefilled"]),
             "status": status,
+            "channel_status": json.loads(row["channel_status"] or "{}"),
             "updated_at": updated_at,
             "email_sent_at": email_sent_at,
             "whatsapp_sent_at": whatsapp_sent_at,
@@ -1020,31 +1032,12 @@ class MarketingDashboard(tk.Tk):
         }
 
     def fetch_stats(self, connection, rows):
-        event_counts = {
-            row["event_type"]: row["count"]
-            for row in connection.execute(
-                "SELECT event_type, COUNT(*) AS count FROM outreach_events GROUP BY event_type"
-            ).fetchall()
-        }
-        websites_fallback = sum(1 for row in rows if row["website"])
-        forms_fallback = sum(1 for row in rows if row["form_prefilled"])
-        email_status_fallback = sum(1 for row in rows if row["status"] in {"sent", "submitted", "email_sent", "fallback_sent"})
-        whatsapp_status_fallback = sum(1 for row in rows if row["status"] in {"whatsapp_sent", "fallback_sent"})
-        contacts_found = sum(1 for row in rows if row["emails"] or row["phones"])
-        drafts_ready = sum(1 for row in rows if row["status"] == "draft_ready")
-        limit = max(1, int(self.config_data.get("limit", len(rows) or 1)))
-        processed = len(rows)
-        return {
-            "websites_opened": max(event_counts.get(EVENT_WEBSITE_OPENED, 0), websites_fallback),
-            "forms_prefilled": max(event_counts.get(EVENT_FORM_PREFILLED, 0), forms_fallback),
-            "emails_sent": max(event_counts.get(EVENT_EMAIL_SENT, 0), email_status_fallback),
-            "whatsapp_sent": max(event_counts.get(EVENT_WHATSAPP_SENT, 0), whatsapp_status_fallback),
-            "drafts_ready": drafts_ready,
-            "contacts_found": contacts_found,
-            "processed": processed,
-            "limit": limit,
-            "progress": min(100, processed / limit * 100),
-        }
+        totals, run = outreach_stats(connection)
+        limit = max(1, int(run.get('target') or self.config_data.get('limit', 10)))
+        processed = run.get('processed', 0)
+        return {**totals, 'new': run.get('new',0), 'already_contacted': run.get('already_contacted',0),
+                'skipped': run.get('skipped',0), 'failed': run.get('failed',0),
+                'processed': processed, 'limit': limit, 'progress': min(100, processed / limit * 100), 'run': run}
 
     def fetch_activity(self, connection):
         return connection.execute(
@@ -1058,7 +1051,13 @@ class MarketingDashboard(tk.Tk):
         for key, var in self.stat_vars.items():
             var.set(str(stats.get(key, 0)))
         self.progress_value.set(stats.get("progress", 0))
-        self.progress_text_var.set(f"{stats.get('processed', 0)} of {stats.get('limit', 0)} target leads")
+        run = stats.get('run', {})
+        self.progress_text_var.set(
+            f"{stats.get('processed', 0)} of {stats.get('limit', 0)} businesses processed\n"
+            f"Found: {run.get('found',0)} | Pages: {run.get('pages',0)}\n"
+            f"Run WhatsApp: {run.get('whatsapp',0)} | Emails: {run.get('emails',0)}\n"
+            f"Run websites: {run.get('websites',0)} | Forms: {run.get('forms',0)}\n"
+            f"{run.get('stop_reason') or run.get('status') or 'No recorded run yet'}")
 
     def populate_activity(self, rows):
         labels = {
@@ -1086,8 +1085,8 @@ class MarketingDashboard(tk.Tk):
         for row in self.rows:
             if query and query not in row["haystack"]:
                 continue
-            email_state = "Sent" if row["email_sent_at"] else ("Ready" if row["emails"] else "-")
-            whatsapp_state = "Sent" if row["whatsapp_sent_at"] else ("Ready" if row["phones"] else "-")
+            email_state = row['channel_status'].get('email',{}).get('status') or ("Sent" if row["email_sent_at"] else ("Ready" if row["emails"] else "-"))
+            whatsapp_state = row['channel_status'].get('whatsapp',{}).get('status') or ("Sent" if row["whatsapp_sent_at"] else ("Ready" if row["phones"] else "-"))
             values = (
                 shorten(row["business_name"], 28),
                 shorten(row["website"], 38),
@@ -1114,6 +1113,8 @@ class MarketingDashboard(tk.Tk):
             f"Email: {'sent' if row['email_sent_at'] else 'not sent'}",
             f"WhatsApp: {'sent' if row['whatsapp_sent_at'] else 'not sent'}",
         ]
+        parts.extend(f"{channel.title()}: {outcome.get('status','pending')} ? {outcome.get('reason','')}"
+                     for channel,outcome in row.get('channel_status',{}).items())
         self.selected_meta_var.set("\n".join(parts))
 
     def selected_row(self):
@@ -1145,7 +1146,7 @@ class MarketingDashboard(tk.Tk):
         self.record_manual_event(row, EVENT_WHATSAPP_SENT, "Marked WhatsApp as sent from dashboard")
 
     def record_manual_event(self, row, event_type, details):
-        with self.connect() as connection:
+        with closing(self.connect()) as connection:
             created = record_event(
                 connection,
                 event_type,
@@ -1250,7 +1251,8 @@ class MarketingDashboard(tk.Tk):
             pid = int(state.get("pid", 0))
             if pid <= 0 or state.get("status") not in {"running", "stopping"}:
                 return None
-            os.kill(pid, 0)
+            if not process_running(pid):
+                return None
             return {"pid": pid, "mode": state.get("mode", "automation")}
         except (OSError, ValueError, TypeError, json.JSONDecodeError):
             return None

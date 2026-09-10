@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hmac
 import json
+from contextlib import closing
 import os
 import signal
 import sqlite3
@@ -16,12 +17,14 @@ from pathlib import Path
 from flask import Flask, Response, jsonify, render_template, request
 
 from app_paths import get_app_dir
+from process_utils import process_running
 from progress_tracker import (
     EVENT_EMAIL_SENT,
     EVENT_FORM_PREFILLED,
     EVENT_WEBSITE_OPENED,
     EVENT_WHATSAPP_SENT,
     ensure_database,
+    outreach_stats,
 )
 
 APP_DIR = Path(get_app_dir())
@@ -104,20 +107,6 @@ def write_state(state):
     temporary.replace(STATE_PATH)
 
 
-def process_running(pid):
-    if not isinstance(pid, int) or pid <= 0:
-        return False
-    try:
-        if os.name != "nt":
-            stat_path = Path(f"/proc/{pid}/stat")
-            if stat_path.exists() and stat_path.read_text(encoding="utf-8").split()[2] == "Z":
-                return False
-        os.kill(pid, 0)
-        return True
-    except (OSError, ProcessLookupError):
-        return False
-
-
 def job_status():
     state = read_state()
     running = process_running(state.get("pid"))
@@ -147,7 +136,7 @@ def index():
 @app.get("/api/dashboard")
 @require_auth
 def dashboard_data():
-    with database() as connection:
+    with closing(database()) as connection:
         rows = connection.execute(
             """SELECT o.*,
                 MAX(CASE WHEN e.event_type = ? THEN e.created_at END) email_sent_at,
@@ -156,11 +145,7 @@ def dashboard_data():
               GROUP BY o.business_key ORDER BY COALESCE(o.updated_at, '') DESC LIMIT 250""",
             (EVENT_EMAIL_SENT, EVENT_WHATSAPP_SENT),
         ).fetchall()
-        counts = dict(
-            connection.execute(
-                "SELECT event_type, COUNT(*) amount FROM outreach_events GROUP BY event_type"
-            ).fetchall()
-        )
+        totals, run = outreach_stats(connection)
 
     leads = []
     for row in rows:
@@ -171,18 +156,16 @@ def dashboard_data():
             "emails": parse_list(row["emails"]),
             "phones": parse_list(row["phones"]),
             "status": row["status"] or "draft_ready",
+            "channel_status": json.loads(row["channel_status"] or "{}"),
+            "form_prefilled": bool(row["form_prefilled"]),
+            "last_error": row["last_error"] or "",
             "updated": row["updated_at"] or "",
-            "email_sent": bool(row["email_sent_at"]) or row["status"] in {"sent", "submitted", "email_sent", "fallback_sent"},
+            "email_sent": bool(row["email_sent_at"]) or row["status"] in {"email_sent", "fallback_sent"},
             "whatsapp_sent": bool(row["whatsapp_sent_at"]) or row["status"] in {"whatsapp_sent", "fallback_sent"},
         })
-    stats = {
-        "websites": counts.get(EVENT_WEBSITE_OPENED, 0),
-        "forms": counts.get(EVENT_FORM_PREFILLED, 0),
-        "emails": counts.get(EVENT_EMAIL_SENT, 0),
-        "whatsapp": counts.get(EVENT_WHATSAPP_SENT, 0),
-        "leads": len(rows),
-    }
-    return jsonify({"stats": stats, "leads": leads, "job": job_status()})
+    stats = {**totals, "leads": totals['businesses']}
+    return jsonify({"stats": stats, "run": run, "leads": leads, "job": job_status()})
+
 
 
 @app.get("/api/settings")
