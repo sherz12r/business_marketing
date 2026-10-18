@@ -96,6 +96,9 @@ IMPORTANT:
 - If the target is itself a software, IT, web, advertising, or marketing
   provider, treat it as a potential partner and propose collaboration rather
   than selling website development or ordinary client services.
+- When confirmed website-audit observations are provided, mention only those
+  observations, do not invent vulnerabilities, and say that we can fix them
+  without giving a detailed technical solution.
 - Do not include sender contact details such as contact name, email, phone, website, or a contact-us block.
 - Do not include a subject line unless specifically requested.
 
@@ -976,6 +979,76 @@ class Automation(GoogleResultsMixin, OutreachChannelsMixin):
             if len(re.sub(r"\D", "", value)) >= 7
         ))
 
+    def audit_current_website(self):
+        """Return conservative, observable homepage findings for outreach."""
+        try:
+            facts = self.driver.execute_script(r"""
+                const attr = (selector, name) => document.querySelector(selector)?.getAttribute(name) || '';
+                const images = Array.from(document.images || []);
+                const forms = Array.from(document.forms || []);
+                const resources = Array.from(document.querySelectorAll('img[src],script[src],link[href]'));
+                return {
+                    url: location.href,
+                    title: (document.title || '').trim(),
+                    description: attr('meta[name="description" i]', 'content').trim(),
+                    canonical: attr('link[rel="canonical" i]', 'href').trim(),
+                    viewport: attr('meta[name="viewport" i]', 'content').trim(),
+                    lang: (document.documentElement.getAttribute('lang') || '').trim(),
+                    h1Count: document.querySelectorAll('h1').length,
+                    imageCount: images.length,
+                    imagesMissingAlt: images.filter(img => !img.hasAttribute('alt') || !img.alt.trim()).length,
+                    insecureForms: forms.filter(form => (form.action || '').toLowerCase().startsWith('http://')).length,
+                    mixedResources: resources.filter(element => {
+                        const value = element.getAttribute('src') || element.getAttribute('href') || '';
+                        return location.protocol === 'https:' && value.toLowerCase().startsWith('http://');
+                    }).length
+                };
+            """) or {}
+        except Exception as exc:
+            self._log(f"Website audit could not be completed: {exc}")
+            return []
+
+        findings = []
+        url = str(facts.get("url", "") or "")
+        title = str(facts.get("title", "") or "").strip()
+        description = str(facts.get("description", "") or "").strip()
+        if url.lower().startswith("http://"):
+            findings.append("The homepage is served over HTTP rather than HTTPS.")
+        if not title:
+            findings.append("The homepage does not provide a page title for search results.")
+        elif len(title) < 20:
+            findings.append("The homepage title is very short and may not describe the business clearly in search results.")
+        elif len(title) > 65:
+            findings.append("The homepage title is long and may be truncated in search results.")
+        if not description:
+            findings.append("The homepage has no meta description for search-result summaries.")
+        elif len(description) < 70:
+            findings.append("The homepage meta description is very short.")
+        elif len(description) > 165:
+            findings.append("The homepage meta description is long and may be truncated in search results.")
+        if not str(facts.get("viewport", "") or "").strip():
+            findings.append("The homepage is missing a mobile viewport declaration, which can affect mobile presentation.")
+        h1_count = int(facts.get("h1Count", 0) or 0)
+        if h1_count == 0:
+            findings.append("The homepage has no main H1 heading.")
+        elif h1_count > 1:
+            findings.append(f"The homepage contains {h1_count} H1 headings, which weakens the page hierarchy.")
+        if not str(facts.get("canonical", "") or "").strip():
+            findings.append("The homepage does not declare a canonical URL.")
+        if not str(facts.get("lang", "") or "").strip():
+            findings.append("The page language is not declared in the HTML.")
+        image_count = int(facts.get("imageCount", 0) or 0)
+        missing_alt = int(facts.get("imagesMissingAlt", 0) or 0)
+        if image_count and missing_alt:
+            findings.append(f"{missing_alt} of {image_count} homepage images are missing descriptive alt text.")
+        insecure_forms = int(facts.get("insecureForms", 0) or 0)
+        if insecure_forms:
+            findings.append(f"{insecure_forms} form(s) submit to an insecure HTTP address.")
+        mixed_resources = int(facts.get("mixedResources", 0) or 0)
+        if mixed_resources:
+            findings.append(f"The HTTPS page loads {mixed_resources} resource(s) over insecure HTTP.")
+        return findings[:6]
+
 
     # =========================================================
     # PROCESS ONE WEBSITE
@@ -1030,16 +1103,19 @@ class Automation(GoogleResultsMixin, OutreachChannelsMixin):
             result["status"] = "skipped_duplicate"
             return result
 
-        # A Google Business Profile phone is checked before any proposal is
-        # written. A confirmed WhatsApp chat avoids opening the external site;
-        # an invalid/unavailable number falls through to website email lookup.
+        # Check the Google Business Profile phone before writing a message.
+        # When a website exists, delay generation/sending until its homepage
+        # has been audited so the outreach can cite real observations.
         if profile_phones:
             self._log(
                 f"Google profile phone found for {name or 'business'}; "
-                "trying WhatsApp before opening the website."
+                "checking WhatsApp before preparing the message."
             )
             try:
-                self.attempt_preferred_outreach(result, website, business_key)
+                if has_website:
+                    self.preflight_whatsapp(result, business_key)
+                else:
+                    self.attempt_preferred_outreach(result, website, business_key)
             except Exception as exc:
                 result["last_error"] = str(exc)
                 self._log(f"Google-profile outreach error: {exc}")
@@ -1060,10 +1136,10 @@ class Automation(GoogleResultsMixin, OutreachChannelsMixin):
             # the website email fallback has actually been checked.
             result["status"] = "processing"
             self.save_outreach(business_key, result)
-            self._log("WhatsApp was not usable; checking the business website for an email address.")
+            self._log("Opening the business website for contact discovery and a homepage audit.")
 
-        # Opaque Google /goto Website buttons are deliberately resolved only
-        # here.  Listings that already supplied a phone never open the site.
+        # Resolve opaque Google /goto Website buttons only when the listing is
+        # ready for contact discovery and homepage analysis.
         redirect_url = website.get("website_redirect_url", "")
         if not url and redirect_url:
             resolved_url = self.resolve_google_website(redirect_url) or ""
@@ -1170,6 +1246,16 @@ class Automation(GoogleResultsMixin, OutreachChannelsMixin):
             self._log(
                 f"Phones found: {phones}"
             )
+
+            audit_findings = self.audit_current_website()
+            website["audit_findings"] = audit_findings
+            result["website_audit"] = audit_findings
+            if audit_findings:
+                self._log(
+                    "Website audit findings: " + " | ".join(audit_findings)
+                )
+            else:
+                self._log("Website audit found no safely reportable homepage issues.")
 
             # -----------------------------------------
             # FIND CONTACT PAGE
@@ -2163,6 +2249,11 @@ class Automation(GoogleResultsMixin, OutreachChannelsMixin):
         )
         business_context = website.get("profile_text") or self.search_query
         partnership_outreach = self.is_similar_service_business(website)
+        audit_findings = [
+            str(finding).strip()
+            for finding in website.get("audit_findings", [])
+            if str(finding).strip()
+        ]
         our_company = self.config.get("company_name", "our web development company")
         prompt_template = str(
             self.config.get("proposal_prompt", "")
@@ -2178,6 +2269,7 @@ class Automation(GoogleResultsMixin, OutreachChannelsMixin):
             "search_query": business_context,
             "company_name": our_company,
             "services": "\n".join(f"- {service}" for service in PROPOSAL_SERVICES),
+            "audit_findings": "\n".join(f"- {finding}" for finding in audit_findings),
         })
 
         try:
@@ -2203,23 +2295,42 @@ class Automation(GoogleResultsMixin, OutreachChannelsMixin):
         elif not has_website:
             prompt += (
                 "\n\nThis business has no website listed. Clearly and politely propose "
-                "creating a new professional business website for them. Do not imply "
-                "that they already have a website."
+                "creating a new professional, modern website to upgrade their online "
+                "presence. Do not imply that they already have a website."
             )
         else:
-            prompt += (
-                "\n\nThis business already has a website listed. Write a short general "
-                "business outreach message offering only relevant supporting digital "
-                "services. Do not propose building a new website, do not claim their "
-                "current website needs redesign, and do not criticize or invent problems "
-                "with their website."
-            )
+            prompt += f"\n\nWEBSITE REVIEW:\nWebsite checked: {website_url or 'Website URL listed on Google'}"
+            if audit_findings:
+                prompt += (
+                    "\nConfirmed homepage observations:\n"
+                    + "\n".join(f"- {finding}" for finding in audit_findings)
+                    + "\n\nWrite a concise outreach message that mentions two to four of "
+                    "these confirmed observations and their likely business impact. Do "
+                    "not provide the full technical solution or step-by-step instructions; "
+                    "simply explain that our team can fix the identified website issues "
+                    "and invite them to discuss the work. Do not invent additional issues. "
+                    "Do not claim the site is hacked, vulnerable, unsafe, penalized, or "
+                    "non-responsive unless the confirmed observations explicitly prove it."
+                )
+            else:
+                prompt += (
+                    "\nNo specific issue was safely confirmed by the automated homepage "
+                    "check. Do not invent an SEO, responsive-design, performance, or security "
+                    "problem. Offer a deeper review and explain that we can fix any confirmed "
+                    "website issues, keeping the message brief."
+                )
 
         if partnership_outreach:
             prompt += (
                 "\n\nKeep the partnership message short, focused, and peer-to-peer. "
                 "Do not list or sell our normal services and do not treat this company "
                 "as an ordinary sales prospect."
+            )
+        elif has_website:
+            prompt += (
+                "\n\nKeep the message focused on the confirmed website observations. "
+                "Do not replace them with a generic list of our services and do not "
+                "include a technical tutorial."
             )
         else:
             prompt += (
@@ -2289,22 +2400,36 @@ class Automation(GoogleResultsMixin, OutreachChannelsMixin):
             or website.get("website_redirect_url")
         )
         if has_website:
+            website_url = str(website.get("url", "") or "").strip()
+            findings = [
+                str(finding).strip()
+                for finding in website.get("audit_findings", [])
+                if str(finding).strip()
+            ][:4]
+            if findings:
+                observations = "\n".join(f"- {finding}" for finding in findings)
+                return (
+                    f"{greeting}\n\n"
+                    f"During a brief review of {website_url or 'your website'}, we noticed "
+                    "a few items that may affect search visibility, mobile usability, or "
+                    f"visitor confidence:\n{observations}\n\n"
+                    "Our team can fix these website issues and help make the site clearer, "
+                    "more search-friendly, and more reliable for visitors. If you are "
+                    "interested, we would be happy to discuss the findings and the work required."
+                )
             return (
                 f"{greeting}\n\n"
-                "We help businesses strengthen their digital presence and day-to-day "
-                "operations through website updates and modifications, custom software, "
-                "accounting and invoicing software, POS, CRM, inventory, e-commerce, "
-                "booking, integrations, automation, maintenance, SEO, and digital "
-                "marketing. We would recommend only the services that fit your actual "
-                "requirements.\n\n"
-                "If any of these services would be useful, we would be happy to learn "
-                "about your requirements and suggest suitable options."
+                f"We took a brief look at {website_url or 'your website'}. Our automated "
+                "homepage check did not confirm a specific issue that would be fair to "
+                "claim without a deeper review. We can perform a closer website review "
+                "and fix any confirmed SEO, mobile-usability, performance, or security-"
+                "baseline issues. If you are interested, we would be happy to discuss it."
             )
 
         return (
             f"{greeting}\n\n"
             "Your Google Business Profile does not currently show a website. We can "
-            "create a professional, mobile-friendly website tailored to your business, "
+            "create a professional, mobile-friendly website to upgrade your online presence, "
             "with clear service information, contact details, location, and online "
             "booking or enquiry features where useful.\n\n"
             "We can also help with domain and hosting, business email, local SEO, "

@@ -52,6 +52,7 @@ class OutreachTests(unittest.TestCase):
             result['_verified_whatsapp_phone'] = candidates[0]
             return candidates[0]
         self.bot.preflight_whatsapp = MagicMock(side_effect=available_whatsapp)
+        self.bot.audit_current_website = MagicMock(return_value=[])
         self.bot.current_area = {}
         self.bot.search_query = 'salons'
         self.bot.headless = True
@@ -189,13 +190,13 @@ class OutreachTests(unittest.TestCase):
         saved=json.loads(self.bot.db.execute('SELECT channel_status FROM outreach').fetchone()[0])
         self.assertEqual(saved['whatsapp']['status'],'failed')
 
-    def test_google_profile_phone_uses_whatsapp_without_opening_website(self):
+    def test_google_profile_phone_waits_for_website_audit_before_whatsapp(self):
         self.bot.generate_website_proposal=MagicMock(return_value='Hello')
         self.bot.send_whatsapp_message=MagicMock(return_value=True)
-        self.bot.open_website=MagicMock()
+        self.bot.open_website=MagicMock(return_value=None)
         self.bot.process_website({'name':'Profile phone','url':'https://fixture.test','phones':['0501112222']})
         self.bot.send_whatsapp_message.assert_called_once()
-        self.bot.open_website.assert_not_called()
+        self.bot.open_website.assert_called_once()
 
     def test_no_website_profile_phone_gets_website_development_message(self):
         self.bot.ask_ai=MagicMock(return_value='Hello')
@@ -203,15 +204,20 @@ class OutreachTests(unittest.TestCase):
         self.bot.process_website({'name':'Phone only','phones':['0501112222']})
         prompt=self.bot.ask_ai.call_args.args[0]
         self.assertIn('no website listed',prompt.lower())
-        self.assertIn('creating a new professional business website',prompt.lower())
+        self.assertIn('creating a new professional, modern website',prompt.lower())
 
-    def test_existing_website_gets_general_message_rule(self):
+    def test_existing_website_prompt_uses_url_and_confirmed_audit_findings(self):
         self.bot.ask_ai=MagicMock(return_value='Hello')
-        self.bot.send_whatsapp_message=MagicMock(return_value=True)
-        self.bot.process_website({'name':'Has site','url':'https://fixture.test','phones':['0501112222']})
+        self.bot.generate_website_proposal({
+            'name':'Has site',
+            'url':'https://fixture.test',
+            'audit_findings':['The homepage has no main H1 heading.'],
+        })
         prompt=self.bot.ask_ai.call_args.args[0]
-        self.assertIn('already has a website listed',prompt.lower())
-        self.assertIn('do not propose building a new website',prompt.lower())
+        self.assertIn('website checked: https://fixture.test',prompt.lower())
+        self.assertIn('the homepage has no main h1 heading',prompt.lower())
+        self.assertIn('our team can fix the identified website issues',prompt.lower())
+        self.assertIn('do not provide the full technical solution',prompt.lower())
 
     def test_software_company_gets_partnership_prompt_not_website_pitch(self):
         self.bot.ask_ai = MagicMock(return_value='Partnership message')
@@ -248,9 +254,10 @@ class OutreachTests(unittest.TestCase):
     def test_ai_failure_uses_local_message_and_continues_to_whatsapp(self):
         self.bot.ask_ai=MagicMock(side_effect=RuntimeError('AI unavailable'))
         self.bot.send_whatsapp_message=MagicMock(return_value=True)
+        self.bot.open_website=MagicMock(return_value=None)
         result=self.bot.process_website({'name':'Fallback Salon','url':'https://fixture.test','phones':['0501112222']})
         self.bot.send_whatsapp_message.assert_called_once()
-        self.assertIn('digital presence',result['proposal'].lower())
+        self.assertIn('deeper review',result['proposal'].lower())
         self.assertNotIn('create a professional, mobile-friendly website',result['proposal'].lower())
 
     def test_ai_failure_without_website_uses_development_fallback(self):
@@ -348,10 +355,47 @@ class OutreachTests(unittest.TestCase):
     def test_local_message_mode_does_not_open_browser_ai(self):
         self.bot.config['use_browser_ai']=False
         self.bot.ask_ai=MagicMock()
-        message=self.bot.generate_website_proposal({'name':'General Trading','url':'https://fixture.test'})
+        message=self.bot.generate_website_proposal({
+            'name':'General Trading',
+            'url':'https://fixture.test',
+            'audit_findings':['The homepage has no meta description for search-result summaries.'],
+        })
         self.bot.ask_ai.assert_not_called()
-        self.assertIn('custom software',message.lower())
-        self.assertIn('accounting',message.lower())
+        self.assertIn('https://fixture.test',message.lower())
+        self.assertIn('no meta description',message.lower())
+        self.assertIn('our team can fix',message.lower())
+
+    def test_homepage_audit_reports_only_observable_signals(self):
+        self.bot.driver.execute_script.return_value = {
+            'url':'http://fixture.test',
+            'title':'Short',
+            'description':'',
+            'canonical':'',
+            'viewport':'',
+            'lang':'',
+            'h1Count':0,
+            'imageCount':4,
+            'imagesMissingAlt':2,
+            'insecureForms':1,
+            'mixedResources':0,
+        }
+        findings = Automation.audit_current_website(self.bot)
+        joined = ' '.join(findings).lower()
+        self.assertIn('http rather than https', joined)
+        self.assertIn('meta description', joined)
+        self.assertIn('mobile viewport', joined)
+        self.assertNotIn('hacked', joined)
+        self.assertLessEqual(len(findings), 6)
+
+    def test_website_audit_is_attached_before_message_generation(self):
+        self.prepare_website()
+        finding = 'The homepage has no main H1 heading.'
+        self.bot.audit_current_website.return_value = [finding]
+        self.bot.fill_contact_form = MagicMock(return_value=False)
+        website = {'name':'Audited business','url':'https://fixture.test'}
+        self.bot.process_website(website)
+        generated_website = self.bot.generate_website_proposal.call_args.args[0]
+        self.assertEqual(generated_website['audit_findings'], [finding])
 
     def prepare_website(self):
         self.bot.open_website=MagicMock(return_value={'window_handle':'site','original_window':'google'})

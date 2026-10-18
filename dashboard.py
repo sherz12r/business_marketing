@@ -93,6 +93,9 @@ IMPORTANT:
 - If the target is itself a software, IT, web, advertising, or marketing
   provider, treat it as a potential partner and propose collaboration rather
   than selling website development or ordinary client services.
+- When confirmed website-audit observations are provided, mention only those
+  observations, do not invent vulnerabilities, and say that we can fix them
+  without giving a detailed technical solution.
 - Do not include sender contact details such as contact name, email, phone, website, or a contact-us block.
 - Do not include a subject line unless specifically requested.
 
@@ -106,7 +109,7 @@ DEFAULT_CONFIG = {
     "limit": 10,
     "google_max_pages": 20,
     "openai_model": "gpt-5.5",
-    "use_browser_ai": False,
+    "use_browser_ai": True,
     "data_dir": "data",
     "review_mode": True,
     "keep_prefilled_tabs_open": True,
