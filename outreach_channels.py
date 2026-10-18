@@ -7,6 +7,28 @@ from selenium.common.exceptions import TimeoutException
 
 
 class OutreachChannelsMixin:
+    def never_repeat_contacted(self):
+        campaign = self.config.get('campaign', {})
+        return isinstance(campaign, dict) and bool(
+            campaign.get('never_repeat_contacted', True)
+        )
+
+    def recipient_was_contacted(self, recipient, event_type):
+        if not self.never_repeat_contacted() or not recipient:
+            return False
+        if event_type == EVENT_WHATSAPP_SENT:
+            return bool(self.db.execute(
+                """SELECT 1 FROM outreach_events
+                   WHERE lower(recipient)=lower(?)
+                     AND event_type IN (?, 'whatsapp_uncertain') LIMIT 1""",
+                (recipient, event_type),
+            ).fetchone())
+        return bool(self.db.execute(
+            """SELECT 1 FROM outreach_events
+               WHERE lower(recipient)=lower(?) AND event_type=? LIMIT 1""",
+            (recipient, event_type),
+        ).fetchone())
+
     def whatsapp_outgoing_ids(self):
         return self.driver.execute_script("return Array.from(document.querySelectorAll('.message-out [data-id], .message-out[data-id], [data-id^=\"true_\"]')).map(e=>e.getAttribute('data-id'));") or []
 
@@ -29,14 +51,16 @@ class OutreachChannelsMixin:
     def recent_channel_events(self, business_key, event_type):
         rows = self.db.execute('SELECT recipient,created_at FROM outreach_events WHERE business_key=? AND event_type=?',
                                (business_key, event_type)).fetchall()
+        never_repeat = self.never_repeat_contacted()
         threshold = datetime.now() - timedelta(days=max(1, int(self.config.get('reprocess_after_days', 40))))
         recent = []
         for recipient, timestamp in rows:
-            try:
-                if datetime.fromisoformat(timestamp) < threshold:
-                    continue
-            except (TypeError, ValueError):
-                pass  # Keep undated history protected.
+            if not never_repeat:
+                try:
+                    if datetime.fromisoformat(timestamp) < threshold:
+                        continue
+                except (TypeError, ValueError):
+                    pass  # Keep undated history protected.
             recent.append(recipient or '')
         if not rows:
             row = self.db.execute('SELECT status,updated_at FROM outreach WHERE business_key=?', (business_key,)).fetchone()
@@ -62,19 +86,40 @@ class OutreachChannelsMixin:
             self.save_outreach(business_key, result)
         return sent
 
+    def whatsapp_candidates(self, result):
+        numbers = list(dict.fromkeys(
+            result.get('whatsapp_phones', []) + result.get('phones', [])
+        ))
+        usable = []
+        candidates = []
+        for number in numbers:
+            normalized = self.primary_whatsapp_phone({'phones': [number]})
+            if normalized and normalized not in usable:
+                usable.append(normalized)
+            if (
+                normalized
+                and normalized not in candidates
+                and not self.recipient_was_contacted(normalized, EVENT_WHATSAPP_SENT)
+            ):
+                candidates.append(normalized)
+        return numbers, usable, candidates
+
     def send_whatsapp_message(self, result, business_key):
         if self.recent_channel_events(business_key, EVENT_WHATSAPP_SENT):
             result['whatsapp_sent'] = True
             return self.channel_outcome(result, 'whatsapp', 'already_sent', 'Within configured contact cooldown')
         if self.recent_channel_events(business_key, 'whatsapp_uncertain'):
             return self.channel_outcome(result, 'whatsapp', 'uncertain', 'Previous click was not confirmed; review WhatsApp before retrying')
-        numbers = list(dict.fromkeys(result.get('whatsapp_phones', []) + result.get('phones', [])))
-        candidates = []
-        for number in numbers:
-            normalized = self.primary_whatsapp_phone({'phones': [number]})
-            if normalized and normalized not in candidates:
-                candidates.append(normalized)
+        numbers, usable, candidates = self.whatsapp_candidates(result)
+        verified = result.get('_verified_whatsapp_phone', '')
+        if verified:
+            candidates = [verified] if verified in candidates else []
         if not candidates:
+            if usable and self.never_repeat_contacted():
+                return self.channel_outcome(
+                    result, 'whatsapp', 'duplicate_recipient',
+                    'All usable numbers were contacted previously',
+                )
             return self.channel_outcome(result, 'whatsapp', 'no_phone', 'No usable number; check discovered contacts and ignored prefixes')
         original_phones = result.get('phones', [])
         try:
@@ -95,11 +140,24 @@ class OutreachChannelsMixin:
     def send_email_message(self, result, business_key):
         recent = self.recent_channel_events(business_key, EVENT_EMAIL_SENT)
         recipients = self.email_recipients(result)
+        globally_contacted = {
+            email.lower() for email in recipients
+            if self.recipient_was_contacted(email.lower(), EVENT_EMAIL_SENT)
+        }
         if '' in recent or (recipients and all(email.lower() in recent for email in recipients)):
             result['email_sent'] = True
             return self.channel_outcome(result, 'email', 'already_sent', 'Within configured contact cooldown')
         # Retry only recipients that SMTP has not already accepted.
-        result['_email_recipients'] = [email for email in recipients if email.lower() not in recent]
+        result['_email_recipients'] = [
+            email for email in recipients
+            if email.lower() not in recent and email.lower() not in globally_contacted
+        ]
+        if recipients and not result['_email_recipients']:
+            result.pop('_email_recipients', None)
+            return self.channel_outcome(
+                result, 'email', 'duplicate_recipient',
+                'All email addresses were contacted previously',
+            )
         try:
             return self._send_email_message(result, business_key)
         finally:

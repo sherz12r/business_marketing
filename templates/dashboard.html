@@ -36,6 +36,14 @@
       <article><span>WhatsApp sent ? Total</span><strong id="statWhatsapp">0</strong></article>
     </section>
 
+    <section class="panel run-panel" aria-label="Area campaign progress">
+      <div class="panel-title"><h3>Area campaign</h3><span id="campaignState">Not initialized</span></div>
+      <progress id="campaignProgress" max="100" value="0"></progress>
+      <p id="campaignCurrent">Enable the campaign to work through the location catalog in order.</p>
+      <div class="run-counts" id="campaignCounts"></div>
+      <details class="area-details"><summary>Show all campaign areas</summary><div id="campaignAreaList" class="area-list"></div></details>
+    </section>
+
     <section class="panel run-panel" aria-label="Latest run statistics">
       <div class="panel-title"><h3>Latest run</h3><span id="runState">No recorded run yet</span></div>
       <progress id="runProgress" max="100" value="0"></progress>

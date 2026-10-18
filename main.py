@@ -29,6 +29,7 @@ from dotenv import load_dotenv
 from google_results import GoogleResultsMixin
 from outreach_channels import OutreachChannelsMixin
 from app_paths import get_app_dir
+from campaign import load_location_catalog, seed_target_areas
 from progress_tracker import (
     EVENT_EMAIL_SENT,
     EVENT_FORM_PREFILLED,
@@ -53,7 +54,7 @@ except ImportError:
 load_dotenv()
 
 
-DEFAULT_PROPOSAL_PROMPT = """You are helping a professional website development company
+DEFAULT_PROPOSAL_PROMPT = """You are helping a professional software and digital-services company
 write a short business introduction for a potential client.
 
 Business name:
@@ -87,12 +88,14 @@ IMPORTANT:
 - Do not mention that AI wrote the message.
 - Invite them to contact us if they are interested.
 - Mention that we can discuss their requirements and provide suitable recommendations.
-- Tailor the proposal to the business type. Mention all sender services that are
-  genuinely relevant to this specific business and explain their practical use.
-- Do not write a generic list or a general-purpose company introduction.
-- For a salon or beauty business, cover relevant needs such as a service and
-  appointment-booking website, POS, website updates and maintenance, local SEO,
-  digital marketing, business email, hosting, and suitable customer-management tools.
+- Infer the likely industry from the business name and profile context.
+- Mention only services that are genuinely relevant to that type of business,
+  such as website work, integrations, custom software, accounting, POS, CRM,
+  inventory, e-commerce, booking, automation, maintenance, SEO, or marketing.
+- Do not write a generic list or imply that every service is suitable.
+- If the target is itself a software, IT, web, advertising, or marketing
+  provider, treat it as a potential partner and propose collaboration rather
+  than selling website development or ordinary client services.
 - Do not include sender contact details such as contact name, email, phone, website, or a contact-us block.
 - Do not include a subject line unless specifically requested.
 
@@ -117,6 +120,20 @@ PROPOSAL_SERVICES = [
     "Domain & Hosting Setup",
     "Custom Business Software",
 ]
+
+
+PARTNER_BUSINESS_PATTERNS = (
+    r"\bsoftware (?:company|development|developer|solutions?|services?)\b",
+    r"\bcustom software\b",
+    r"\b(?:it|information technology) (?:company|consulting|consultancy|solutions?|services?|support)\b",
+    r"\bweb(?:site)? (?:design|development|developer|agency|solutions?)\b",
+    r"\b(?:mobile )?app development\b",
+    r"\bdigital marketing\b",
+    r"\b(?:marketing|advertising|seo|social media|branding|creative) agency\b",
+    r"\binternet marketing service\b",
+    r"\bmarketing consultant\b",
+    r"\btechnology (?:company|consulting|consultancy|solutions?|services?)\b",
+)
 
 
 class SafePromptValues(dict):
@@ -180,6 +197,8 @@ class Automation(GoogleResultsMixin, OutreachChannelsMixin):
         self.db.commit()
         self.driver = None
         self.whatsapp_login_wait_used = False
+        self.whatsapp_window = None
+        self.current_area = {}
 
         if self.mode == "pending-email":
             try:
@@ -277,6 +296,7 @@ class Automation(GoogleResultsMixin, OutreachChannelsMixin):
                 "email_sent": bool(row["email_sent"]),
                 "whatsapp_sent": bool(row["whatsapp_sent"]),
                 "whatsapp_phones": self.parse_stored_list(row["whatsapp_phones"]),
+                "area_key": row["area_key"] or "",
                 "run_id": self.run_id,
             }
             business_key = row[0]
@@ -421,10 +441,14 @@ class Automation(GoogleResultsMixin, OutreachChannelsMixin):
     def start_automation(self):
         self._log("Automation run started.")
         try:
-            google_page = self.search_business()
-            if google_page is None:
-                raise RuntimeError("Could not open Google")
-            results = self.process_all_websites(google_page, limit=self.limit)
+            campaign_config = self.config.get("campaign", {})
+            if isinstance(campaign_config, dict) and campaign_config.get("enabled"):
+                results = self.run_location_campaign(campaign_config)
+            else:
+                google_page = self.search_business()
+                if google_page is None:
+                    raise RuntimeError("Could not open Google")
+                results = self.process_all_websites(google_page, limit=self.limit)
             _, run = outreach_stats(self.db)
             self._log(f"Run finished: {run.get('found', 0)} found, {run.get('new', 0)} new, "
                       f"{run.get('already_contacted', 0)} already contacted, {run.get('processed', 0)} processed, "
@@ -442,6 +466,126 @@ class Automation(GoogleResultsMixin, OutreachChannelsMixin):
             raise
         finally:
             self._close_browser_safely()
+
+    def run_location_campaign(self, campaign_config):
+        """Process an ordered, persistent country/city/area campaign queue."""
+        catalog_value = str(campaign_config.get("locations_file", "locations/uae.json")).strip()
+        catalog_path = Path(catalog_value).expanduser()
+        if not catalog_path.is_absolute():
+            catalog_path = Path(get_app_dir()) / catalog_path
+        country = str(campaign_config.get("country", "United Arab Emirates")).strip()
+        locations = load_location_catalog(catalog_path, country=country)
+        added = seed_target_areas(self.db, locations)
+        self._log(
+            f"Territory campaign loaded: {len(locations)} areas, {added} newly queued."
+        )
+
+        max_areas = max(0, int(campaign_config.get("max_areas_per_run", 1)))
+        per_area_limit = max(1, int(campaign_config.get("businesses_per_area", self.limit)))
+        query_template = str(campaign_config.get(
+            "query_template", "businesses in {area}, {city}, {region}, {country}"
+        )).strip()
+        queue = self.db.execute(
+            """SELECT * FROM target_areas
+               WHERE country=? AND status IN ('pending','in_progress','blocked')
+               ORDER BY CASE status WHEN 'in_progress' THEN 0 WHEN 'blocked' THEN 1 ELSE 2 END,
+                        position, area_key""",
+            (country,),
+        ).fetchall()
+        if max_areas:
+            queue = queue[:max_areas]
+        self.db.execute(
+            "UPDATE outreach_runs SET search_query=?,target=? WHERE id=?",
+            (f"Area campaign: {country}", per_area_limit * len(queue), self.run_id),
+        )
+        self.db.commit()
+
+        all_results = []
+        campaign_status = "completed"
+        stop_reason = "No pending campaign areas"
+        for row in queue:
+            area = dict(row)
+            self.current_area = area
+            try:
+                query = query_template.format_map(SafePromptValues(area)).strip()
+            except Exception:
+                query = f"businesses in {area['area']}, {area['city']}, {area['country']}"
+            self.search_query = query
+            now = datetime.now().isoformat(timespec="seconds")
+            self.db.execute(
+                """UPDATE target_areas SET status='in_progress',attempt_count=attempt_count+1,
+                          last_query=?,started_at=CASE WHEN started_at='' THEN ? ELSE started_at END,
+                          updated_at=?,last_error=''
+                   WHERE area_key=?""",
+                (query, now, now, area["area_key"]),
+            )
+            self.db.commit()
+            self._log(
+                f"Campaign area {area['position']}/{len(locations)}: "
+                f"{area['area']}, {area['city']}, {area['region']}"
+            )
+
+            google_page = self.search_business()
+            if google_page is None:
+                raise RuntimeError("Could not open Google")
+            area_results = self.process_all_websites(
+                google_page,
+                limit=per_area_limit,
+                finalize_run=False,
+            )
+            all_results.extend(area_results)
+            outcome = getattr(self, "last_search_outcome", {})
+            reason = outcome.get("reason", "Search stopped")
+            area_status = "in_progress"
+            if outcome.get("status") == "blocked":
+                area_status = "blocked"
+                campaign_status = "blocked"
+            elif (
+                reason.startswith("No next Google page")
+                or reason.startswith("Google returned a repeated")
+                or reason.startswith("Google page limit reached")
+            ):
+                area_status = "completed"
+
+            found = self.db.execute(
+                "SELECT COUNT(DISTINCT business_key) FROM run_businesses WHERE area_key=?",
+                (area["area_key"],),
+            ).fetchone()[0]
+            processed = self.db.execute(
+                """SELECT COUNT(DISTINCT business_key) FROM run_businesses
+                   WHERE area_key=? AND processed=1""", (area["area_key"],)
+            ).fetchone()[0]
+            sent = self.db.execute(
+                """SELECT COUNT(*) FROM outreach_events
+                   WHERE area_key=? AND event_type IN (?,?)""",
+                (area["area_key"], EVENT_WHATSAPP_SENT, EVENT_EMAIL_SENT),
+            ).fetchone()[0]
+            finished = datetime.now().isoformat(timespec="seconds")
+            self.db.execute(
+                """UPDATE target_areas SET status=?,businesses_found=?,businesses_processed=?,
+                          messages_sent=?,completed_at=?,updated_at=?,last_error=?
+                   WHERE area_key=?""",
+                (
+                    area_status, found, processed, sent,
+                    finished if area_status == "completed" else "", finished,
+                    reason if area_status == "blocked" else "", area["area_key"],
+                ),
+            )
+            self.db.commit()
+            self._log(
+                f"Area status: {area_status}; {found} businesses stored, "
+                f"{sent} messages sent. {reason}"
+            )
+            stop_reason = f"Campaign paused after {area['area']}: {reason}"
+            # Preserve a strict geographic queue: do not advance to the next
+            # area until the current area's accessible Google result pages
+            # have been exhausted.
+            if area_status != "completed":
+                break
+
+        self.current_area = {}
+        self.finish_run(campaign_status, stop_reason)
+        return all_results
 
 
     def open_website(self, website):
@@ -849,6 +993,13 @@ class Automation(GoogleResultsMixin, OutreachChannelsMixin):
             ""
         )
 
+        profile_phones = list(dict.fromkeys(website.get("phones", [])))
+        has_website = bool(
+            url
+            or website.get("has_website")
+            or website.get("website_redirect_url")
+        )
+
         self._log(
             f"Processing: {url}"
         )
@@ -857,8 +1008,8 @@ class Automation(GoogleResultsMixin, OutreachChannelsMixin):
             "name": name,
             "website": url,
             "contact_page": "",
-            "emails": [],
-            "phones": list(website.get("phones", [])),
+            "emails": list(dict.fromkeys(website.get("emails", []))),
+            "phones": profile_phones[:],
             "proposal": "",
             "form_prefilled": False,
             "email_sent": False,
@@ -868,11 +1019,10 @@ class Automation(GoogleResultsMixin, OutreachChannelsMixin):
             "channel_status": {},
             "whatsapp_phones": website.get("whatsapp_phones", [])
         }
-
-        if url and self.is_ignored_url(url):
-            self._log(f"Skipping configured ignored URL: {url}")
-            result["status"] = "ignored_url"
-            return result
+        result.update({
+            key: website.get(key, "")
+            for key in ("area_key", "country", "region", "city", "area")
+        })
 
         business_key = self.business_key(website)
         if self.was_previously_processed(business_key):
@@ -880,18 +1030,60 @@ class Automation(GoogleResultsMixin, OutreachChannelsMixin):
             result["status"] = "skipped_duplicate"
             return result
 
-        if not url:
-            self._log(f"No website listed for {name}; creating a website-service draft.")
+        # A Google Business Profile phone is checked before any proposal is
+        # written. A confirmed WhatsApp chat avoids opening the external site;
+        # an invalid/unavailable number falls through to website email lookup.
+        if profile_phones:
+            self._log(
+                f"Google profile phone found for {name or 'business'}; "
+                "trying WhatsApp before opening the website."
+            )
             try:
-                result["proposal"] = self.generate_website_proposal(website)
-                self.run_fallback_channels(
-                    result,
-                    business_key,
-                    reason="no website available"
-                )
+                self.attempt_preferred_outreach(result, website, business_key)
+            except Exception as exc:
+                result["last_error"] = str(exc)
+                self._log(f"Google-profile outreach error: {exc}")
+            whatsapp_status = result.get("channel_status", {}).get("whatsapp", {}).get("status")
+            terminal = (
+                result.get("whatsapp_sent")
+                or result.get("email_sent")
+                or whatsapp_status in {"uncertain", "review", "already_sent"}
+                or not has_website
+            )
+            if terminal:
                 self.update_result_status(result)
                 self.save_outreach(business_key, result)
-                self.append_draft(result)
+                if result.get("proposal"):
+                    self.append_draft(result)
+                return result
+            # Keep an interrupted preflight eligible for a future retry until
+            # the website email fallback has actually been checked.
+            result["status"] = "processing"
+            self.save_outreach(business_key, result)
+            self._log("WhatsApp was not usable; checking the business website for an email address.")
+
+        # Opaque Google /goto Website buttons are deliberately resolved only
+        # here.  Listings that already supplied a phone never open the site.
+        redirect_url = website.get("website_redirect_url", "")
+        if not url and redirect_url:
+            resolved_url = self.resolve_google_website(redirect_url) or ""
+            if resolved_url:
+                website["url"] = resolved_url
+                url = resolved_url
+                result["website"] = resolved_url
+
+        if url and self.is_ignored_url(url):
+            self._log(f"Skipping configured ignored URL: {url}")
+            result["status"] = "ignored_url"
+            return result
+
+        if not url:
+            try:
+                self.attempt_preferred_outreach(result, website, business_key)
+                self.update_result_status(result)
+                self.save_outreach(business_key, result)
+                if result.get("proposal"):
+                    self.append_draft(result)
             except Exception as exc:
                 result["status"] = "draft_error"
                 result["last_error"] = str(exc)
@@ -907,10 +1099,9 @@ class Automation(GoogleResultsMixin, OutreachChannelsMixin):
         if not tab_info:
             result['last_error'] = 'Website could not be opened'
             try:
-                result['proposal'] = self.generate_website_proposal(website) or ''
+                self.attempt_preferred_outreach(result, website, business_key)
             except Exception as exc:
-                self._log(f'Proposal error: {exc}')
-            self.run_fallback_channels(result, business_key, reason='website unavailable')
+                self._log(f'Outreach error: {exc}')
             self.update_result_status(result)
             result['status'] = 'website_error'
             self.save_outreach(business_key, result)
@@ -1081,26 +1272,12 @@ class Automation(GoogleResultsMixin, OutreachChannelsMixin):
                         f"Contact page error: {e}"
                     )
 
-            # -----------------------------------------
-            # GENERATE PROPOSAL
-            # -----------------------------------------
-
+            # Validate WhatsApp first. Only after a usable WhatsApp chat or an
+            # email address is found do we spend time creating the message.
             try:
+                self.attempt_preferred_outreach(result, website, business_key)
 
-                self._log(
-                    "Generating website proposal..."
-                )
-
-                proposal = self.generate_website_proposal(
-                    website
-                )
-
-                if proposal:
-
-                    self._log("Proposal generated:")
-                    self._log(proposal)
-                    result["proposal"] = proposal
-
+                if result.get("proposal"):
                     contact_name = self.get_config_or_env(
                         "contact_name",
                         "CONTACT_US_NAME"
@@ -1161,30 +1338,14 @@ class Automation(GoogleResultsMixin, OutreachChannelsMixin):
                         except Exception as exc:
                             self._log(f"Progress event error: {exc}")
                         self._log("Review mode: form prefilled but not submitted.")
-
-                    # WhatsApp and email are required outreach channels, not
-                    # merely fallbacks for websites without a contact form.
-                    # Attempt both after preparing the proposal regardless of
-                    # whether a form was also filled successfully.
-
-
-                else:
-
-                    self._log(
-                        "Could not generate proposal."
-                    )
-
             except Exception as e:
-
                 self._log(
-                    f"Proposal generation error: {e}"
+                    f"Outreach preparation error: {e}"
                 )
 
             # -----------------------------------------
             # FINAL RESULT
             # -----------------------------------------
-
-            self.run_fallback_channels(result, business_key, reason="website checked")
 
             if (
                 result["emails"]
@@ -1202,7 +1363,8 @@ class Automation(GoogleResultsMixin, OutreachChannelsMixin):
 
             self.update_result_status(result)
             self.save_outreach(business_key, result)
-            self.append_draft(result)
+            if result.get("proposal"):
+                self.append_draft(result)
             return result
 
         except Exception as e:
@@ -1210,7 +1372,10 @@ class Automation(GoogleResultsMixin, OutreachChannelsMixin):
             self._log(f"Website processing error: {e}")
             result['status'] = 'error'
             result['last_error'] = str(e)
-            self.run_fallback_channels(result, business_key, reason='website processing error')
+            try:
+                self.attempt_preferred_outreach(result, website, business_key)
+            except Exception as outreach_exc:
+                self._log(f"Fallback outreach error: {outreach_exc}")
             self.save_outreach(business_key, result)
             return result
 
@@ -1274,13 +1439,14 @@ class Automation(GoogleResultsMixin, OutreachChannelsMixin):
         row = self.db.execute("SELECT status FROM outreach WHERE business_key=?", (key,)).fetchone()
         contacted = bool(self.db.execute("SELECT 1 FROM outreach_events WHERE business_key=? AND event_type IN (?,?) LIMIT 1",
                          (key, EVENT_EMAIL_SENT, EVENT_WHATSAPP_SENT)).fetchone()) or bool(row and row[0] in {'email_sent','whatsapp_sent','fallback_sent','submitted','sent'})
-        self.db.execute("INSERT OR IGNORE INTO run_businesses(run_id,business_key,is_new,already_contacted) VALUES(?,?,?,?)",
-                        (self.run_id, key, int(not row), int(contacted)))
-        self.db.execute("INSERT OR IGNORE INTO outreach(business_key,business_name,website,phones,status) VALUES(?,?,?,?,?)",
-                        (key, website.get('name',''), website.get('url',''), json.dumps(website.get('phones',[])), 'discovered'))
+        area_key = website.get('area_key') or getattr(self, 'current_area', {}).get('area_key', '')
+        self.db.execute("INSERT OR IGNORE INTO run_businesses(run_id,business_key,is_new,already_contacted,area_key) VALUES(?,?,?,?,?)",
+                        (self.run_id, key, int(not row), int(contacted), area_key))
+        self.db.execute("INSERT OR IGNORE INTO outreach(business_key,business_name,website,phones,status,area_key) VALUES(?,?,?,?,?,?)",
+                        (key, website.get('name',''), website.get('url',''), json.dumps(website.get('phones',[])), 'discovered', area_key))
         self.db.commit()
 
-    def process_all_websites(self, google_page, limit=20):
+    def process_all_websites(self, google_page, limit=20, finalize_run=True):
         results, seen_candidates, seen_pages = [], set(), set()
         processed = 0
         reason, run_status = 'Google page limit reached', 'completed'
@@ -1302,6 +1468,12 @@ class Automation(GoogleResultsMixin, OutreachChannelsMixin):
             self.db.commit()
             self._log(f'Google page {page_number}: {len(websites)} candidates; {processed}/{limit} processed.')
             for website in websites:
+                current_area = getattr(self, 'current_area', {})
+                if current_area:
+                    website.update({
+                        key: current_area.get(key, "")
+                        for key in ("area_key", "country", "region", "city", "area")
+                    })
                 # Stable saved names let a previously phone-only listing retain its history.
                 matching = self.db.execute("SELECT business_key FROM outreach WHERE lower(business_name)=? AND (website IS NULL OR website='') LIMIT 1",
                                            ((website.get('name') or '').strip().lower(),)).fetchone()
@@ -1319,7 +1491,8 @@ class Automation(GoogleResultsMixin, OutreachChannelsMixin):
                     result = self.process_website(website)
                 except Exception as exc:
                     result = dict(name=website.get('name',''), website=website.get('url',''),
-                                  phones=website.get('phones',[]), status='error', last_error=str(exc), run_id=self.run_id)
+                                  phones=website.get('phones',[]), status='error', last_error=str(exc),
+                                  run_id=self.run_id, area_key=website.get('area_key',''))
                     self.save_outreach(key, result)
                     self._log(f"Business processing failed; continuing: {exc}")
                 checked = result.get('status') not in {'skipped_duplicate','ignored_url'}
@@ -1337,114 +1510,72 @@ class Automation(GoogleResultsMixin, OutreachChannelsMixin):
             if not self.go_to_next_google_page():
                 reason = 'No next Google page or additional business results'
                 break
-        self.finish_run(run_status, reason)
+        self.last_search_outcome = {
+            "status": run_status,
+            "reason": reason,
+            "processed": processed,
+            "pages": page_number,
+        }
+        if finalize_run:
+            self.finish_run(run_status, reason)
         return results
 
 
     def resolve_google_website(self, google_url):
-
         original_window = None
+        original_handles = set()
+        final_url = ""
 
         try:
-
             original_window = self.driver.current_window_handle
-
-            self._log(
-                f"Resolving Google website link..."
-            )
-
-            # Open the Google redirect in a new tab
+            original_handles = set(self.driver.window_handles)
+            self._log("Resolving Google website link...")
             self.driver.switch_to.new_window("tab")
-
             self.driver.get(google_url)
 
-            # Wait for navigation
             try:
-
-                WebDriverWait(
-                    self.driver,
-                    15
-                ).until(
-                    lambda d: (
-                        d.current_url.startswith("http://")
-                        or d.current_url.startswith("https://")
-                    )
+                WebDriverWait(self.driver, 15).until(
+                    lambda d: d.current_url.startswith(("http://", "https://"))
                 )
-
             except TimeoutException:
-
-                self._log(
-                    "Timeout while resolving Google website."
-                )
+                self._log("Timeout while resolving Google website.")
 
             final_url = self.driver.current_url
-
-            self._log(
-                f"Resolved URL: {final_url}"
-            )
-
-            # Close temporary tab
+            self._log(f"Resolved URL: {final_url}")
+        except Exception as exc:
+            # A Google redirect can close its temporary tab.  Treat that as a
+            # failed resolution, restore the results tab in finally, and keep
+            # the overall automation run alive.
+            self._log(f"Error resolving Google website: {exc}")
+        finally:
             try:
-                self.driver.close()
+                current_handles = list(self.driver.window_handles)
+            except Exception:
+                current_handles = []
+
+            for handle in [h for h in current_handles if h not in original_handles]:
+                try:
+                    self.driver.switch_to.window(handle)
+                    self.driver.close()
+                except Exception:
+                    pass
+
+            try:
+                remaining = list(self.driver.window_handles)
+                if original_window in remaining:
+                    self.driver.switch_to.window(original_window)
+                elif remaining:
+                    self.driver.switch_to.window(remaining[0])
             except Exception:
                 pass
 
-            # Return to Google
-            try:
-                self.driver.switch_to.window(
-                    original_window
-                )
-            except Exception:
-                pass
-
-            # Check whether we actually reached a real website
-            if not final_url:
-                return None
-
-            if "google.com" in urlparse(
-                final_url
-            ).netloc.lower():
-
-                self._log(
-                    f"Still on Google, ignoring: {final_url}"
-                )
-
-                return None
-
-            if "google.ae" in urlparse(
-                final_url
-            ).netloc.lower():
-
-                return None
-
-            return final_url
-
-        except Exception as e:
-
-            self._log(
-                f"Error resolving Google website: {e}"
-            )
-
-            # Try to restore original tab
-            try:
-
-                if original_window:
-
-                    if self.driver.current_window_handle != original_window:
-
-                        try:
-                            self.driver.close()
-                        except Exception:
-                            pass
-
-                        self.driver.switch_to.window(
-                            original_window
-                        )
-
-            except Exception:
-                pass
-
+        if not final_url:
             return None
+        host = (urlparse(final_url).hostname or "").lower()
+        if host == "google.com" or host.endswith(".google.com") or host == "google.ae" or host.endswith(".google.ae"):
+            self._log(f"Still on Google, ignoring: {final_url}")
+            return None
+        return final_url
 
 
     def _find_chatgpt_editor(self, page):
@@ -2008,15 +2139,30 @@ class Automation(GoogleResultsMixin, OutreachChannelsMixin):
 
 
 
+    def is_similar_service_business(self, website):
+        """Identify software, IT, web, and marketing providers suitable for partnership."""
+        context = " ".join((
+            str(website.get("name", "") or ""),
+            str(website.get("profile_text", "") or ""),
+            str(website.get("category", "") or ""),
+        )).lower()
+        return any(re.search(pattern, context) for pattern in PARTNER_BUSINESS_PATTERNS)
+
     def generate_website_proposal(self, website):
         """
-        Generate a professional website-development proposal
-        based on the business information.
+        Generate industry-aware outreach based on the business information and
+        whether Google lists an existing website.
         """
 
         company_name = website.get("name", "")
         website_url = website.get("url", "")
-        business_context = self.search_query
+        has_website = bool(
+            website_url
+            or website.get("has_website")
+            or website.get("website_redirect_url")
+        )
+        business_context = website.get("profile_text") or self.search_query
+        partnership_outreach = self.is_similar_service_business(website)
         our_company = self.config.get("company_name", "our web development company")
         prompt_template = str(
             self.config.get("proposal_prompt", "")
@@ -2024,7 +2170,10 @@ class Automation(GoogleResultsMixin, OutreachChannelsMixin):
         ).strip()
         prompt_values = SafePromptValues({
             "business_name": company_name,
-            "website_url": website_url,
+            "website_url": website_url or (
+                "Website is listed on the Google Business Profile"
+                if has_website else "No website is listed"
+            ),
             "business_context": business_context,
             "search_query": business_context,
             "company_name": our_company,
@@ -2039,24 +2188,51 @@ class Automation(GoogleResultsMixin, OutreachChannelsMixin):
             )
             prompt = DEFAULT_PROPOSAL_PROMPT.format_map(prompt_values)
 
-        if not website_url:
+        if partnership_outreach:
+            prompt += (
+                "\n\nPARTNERSHIP OUTREACH REQUIREMENT:\n"
+                "This business appears to provide software, IT, website, advertising, "
+                "or digital-marketing services similar or complementary to ours. Do not "
+                "pitch website creation, website improvement, or ordinary client services "
+                "to them. Instead, write a concise business-opportunity message proposing "
+                "a mutually beneficial partnership. Suitable ideas include reciprocal "
+                "referrals, white-label delivery, subcontracting, overflow project support, "
+                "and combining complementary expertise. Do not assume which arrangement "
+                "they need; invite a brief discussion about possible collaboration."
+            )
+        elif not has_website:
             prompt += (
                 "\n\nThis business has no website listed. Clearly and politely propose "
                 "creating a new professional business website for them. Do not imply "
                 "that they already have a website."
             )
+        else:
+            prompt += (
+                "\n\nThis business already has a website listed. Write a short general "
+                "business outreach message offering only relevant supporting digital "
+                "services. Do not propose building a new website, do not claim their "
+                "current website needs redesign, and do not criticize or invent problems "
+                "with their website."
+            )
 
-        prompt += (
-            "\n\nTAILORING REQUIREMENT:\n"
-            "Identify the business type from the business name and search/category context. "
-            "Write a specific proposal for that type of business, not a generic marketing message. "
-            "Mention all services from the provided service list that are realistically useful "
-            "to this business, and briefly connect each service to a likely practical use without "
-            "claiming the business currently has a problem. For salons and beauty businesses, "
-            "include a service/appointment-booking website, POS, ongoing website updates and "
-            "maintenance, local SEO, digital marketing, business email, hosting, and relevant "
-            "customer or inventory management solutions. Keep the result focused and readable."
-        )
+        if partnership_outreach:
+            prompt += (
+                "\n\nKeep the partnership message short, focused, and peer-to-peer. "
+                "Do not list or sell our normal services and do not treat this company "
+                "as an ordinary sales prospect."
+            )
+        else:
+            prompt += (
+                "\n\nTAILORING REQUIREMENT:\n"
+                "Identify the business type from the business name and search/category context. "
+                "Write a specific message for that type of business, not a generic marketing message. "
+                "Select only the services from the provided service list that are realistically useful "
+                "to this business, and briefly connect each service to a likely practical use without "
+                "claiming the business currently has a problem. It may offer website updates or "
+                "modifications, a new website when none is listed, custom software, accounting, POS, "
+                "CRM, inventory, booking, e-commerce, integrations, automation, maintenance, SEO, or "
+                "digital marketing when appropriate. Keep the result short, focused, and readable."
+            )
 
         lower_prompt = prompt.lower()
         final_rules = []
@@ -2072,11 +2248,70 @@ class Automation(GoogleResultsMixin, OutreachChannelsMixin):
         if final_rules:
             prompt = f"{prompt}\n\nFINAL RULES:\n" + "\n".join(final_rules)
 
-        return self.ask_ai(
-            prompt,
-            domain=company_name,
-            filename="proposal"
-        ) 
+        if not os.environ.get("OPENAI_API_KEY") and not bool(
+            self.config.get("use_browser_ai", False)
+        ):
+            self._log("No OpenAI API key configured; using fast local outreach message.")
+            return self.fallback_outreach_message(website)
+
+        try:
+            return self.ask_ai(
+                prompt,
+                domain=company_name,
+                filename="proposal"
+            )
+        except Exception as exc:
+            # Outreach should not stop solely because the optional AI service
+            # or browser session is unavailable.  The local template preserves
+            # the important website/no-website distinction and lets the bot
+            # continue to WhatsApp.
+            self._log(f"AI message generation unavailable; using local fallback: {exc}")
+            return self.fallback_outreach_message(website)
+
+    def fallback_outreach_message(self, website):
+        business_name = str(website.get("name", "") or "").strip()
+        greeting = f"Hello {business_name} team," if business_name else "Hello,"
+        if self.is_similar_service_business(website):
+            return (
+                f"{greeting}\n\n"
+                "We work in software and digital services and would be interested in "
+                "exploring a mutually beneficial business opportunity with your team. "
+                "Depending on our respective strengths, we could potentially collaborate "
+                "through reciprocal referrals, white-label delivery, subcontracting, "
+                "overflow project support, or complementary expertise.\n\n"
+                "If this is of interest, we would be happy to have a brief conversation "
+                "to understand each other's capabilities and discuss where collaboration "
+                "could create value for both businesses."
+            )
+        has_website = bool(
+            website.get("url")
+            or website.get("has_website")
+            or website.get("website_redirect_url")
+        )
+        if has_website:
+            return (
+                f"{greeting}\n\n"
+                "We help businesses strengthen their digital presence and day-to-day "
+                "operations through website updates and modifications, custom software, "
+                "accounting and invoicing software, POS, CRM, inventory, e-commerce, "
+                "booking, integrations, automation, maintenance, SEO, and digital "
+                "marketing. We would recommend only the services that fit your actual "
+                "requirements.\n\n"
+                "If any of these services would be useful, we would be happy to learn "
+                "about your requirements and suggest suitable options."
+            )
+
+        return (
+            f"{greeting}\n\n"
+            "Your Google Business Profile does not currently show a website. We can "
+            "create a professional, mobile-friendly website tailored to your business, "
+            "with clear service information, contact details, location, and online "
+            "booking or enquiry features where useful.\n\n"
+            "We can also help with domain and hosting, business email, local SEO, "
+            "digital marketing, ongoing maintenance, POS, CRM, and related business "
+            "software. If you are interested, we would be happy to discuss your "
+            "requirements and recommend a practical solution."
+        )
 
     def contact_details_block(self):
         lines = []
@@ -2253,6 +2488,168 @@ class Automation(GoogleResultsMixin, OutreachChannelsMixin):
 
         return ""
 
+    def check_whatsapp_phone(self, phone):
+        """Open a WhatsApp chat without composing a message and verify it exists."""
+        reuse_tab = self.get_bool_setting(
+            "whatsapp", "reuse_tab", default=True
+        )
+        send_timeout = max(10, int(self.get_section_setting(
+            "whatsapp", "send_timeout_seconds", default=30
+        )))
+        login_timeout = max(10, int(self.get_section_setting(
+            "whatsapp", "login_timeout_seconds", default=180
+        )))
+        timeout = login_timeout if not self.whatsapp_login_wait_used else send_timeout
+        original_window = None
+        whatsapp_window = None
+
+        try:
+            original_window = self.driver.current_window_handle
+            existing = getattr(self, "whatsapp_window", None)
+            if reuse_tab and existing in self.driver.window_handles:
+                whatsapp_window = existing
+                self.driver.switch_to.window(whatsapp_window)
+                self._log("Reusing the existing WhatsApp tab for number validation.")
+            else:
+                self.driver.switch_to.new_window("tab")
+                whatsapp_window = self.driver.current_window_handle
+                if reuse_tab:
+                    self.whatsapp_window = whatsapp_window
+
+            # Deliberately omit the text query parameter. Message generation
+            # happens only after WhatsApp confirms that this chat is usable.
+            self.driver.get(f"https://web.whatsapp.com/send?phone={phone}")
+
+            def chat_state(driver):
+                unavailable = self.whatsapp_unavailable_reason(driver)
+                if unavailable:
+                    self.dismiss_whatsapp_unavailable_dialog(driver)
+                    return ("not_on_whatsapp", unavailable)
+                selectors = (
+                    "#main footer [contenteditable='true']",
+                    "#main footer",
+                    "[data-testid='conversation-panel-wrapper'] footer",
+                )
+                for selector in selectors:
+                    try:
+                        if any(element.is_displayed() for element in driver.find_elements(By.CSS_SELECTOR, selector)):
+                            return ("available", "WhatsApp chat is available")
+                    except Exception:
+                        continue
+                return False
+
+            state, reason = WebDriverWait(
+                self.driver, timeout, poll_frequency=0.15
+            ).until(chat_state)
+            self.whatsapp_login_wait_used = True
+            return state, reason
+        except TimeoutException:
+            unavailable = self.whatsapp_unavailable_reason()
+            if unavailable:
+                self.dismiss_whatsapp_unavailable_dialog()
+                self.whatsapp_login_wait_used = True
+                return "not_on_whatsapp", unavailable
+            return "failed", "WhatsApp chat did not become ready; login may be required"
+        except Exception as exc:
+            return "failed", str(exc)
+        finally:
+            try:
+                if (
+                    not reuse_tab
+                    and whatsapp_window
+                    and whatsapp_window in self.driver.window_handles
+                ):
+                    self.driver.switch_to.window(whatsapp_window)
+                    self.driver.close()
+                if original_window and original_window in self.driver.window_handles:
+                    self.driver.switch_to.window(original_window)
+            except Exception:
+                pass
+
+    def preflight_whatsapp(self, result, business_key):
+        """Return the first confirmed WhatsApp number without creating a message."""
+        if not self.get_bool_setting("whatsapp", "enabled", default=True):
+            self.channel_outcome(result, "whatsapp", "disabled", "Disabled in settings")
+            return ""
+        if self.recent_channel_events(business_key, EVENT_WHATSAPP_SENT):
+            result["whatsapp_sent"] = True
+            self.channel_outcome(result, "whatsapp", "already_sent", "Within configured contact cooldown")
+            return ""
+        if self.recent_channel_events(business_key, "whatsapp_uncertain"):
+            self.channel_outcome(result, "whatsapp", "uncertain", "Previous click was not confirmed; review WhatsApp before retrying")
+            return ""
+
+        numbers, usable, candidates = self.whatsapp_candidates(result)
+        if not candidates:
+            if usable and self.never_repeat_contacted():
+                self.channel_outcome(result, "whatsapp", "duplicate_recipient", "All usable numbers were contacted previously")
+            else:
+                self.channel_outcome(result, "whatsapp", "no_phone", "No usable phone number found")
+            return ""
+
+        checked = result.setdefault("_whatsapp_checked_numbers", {})
+        saw_failure = False
+        last_reason = ""
+        for phone in candidates:
+            cached = checked.get(phone)
+            if cached:
+                state, reason = cached.get("status", "failed"), cached.get("reason", "")
+            else:
+                self._log(f"Checking whether {phone} is available on WhatsApp before writing a message.")
+                state, reason = self.check_whatsapp_phone(phone)
+                checked[phone] = {"status": state, "reason": reason}
+
+            if state == "available":
+                result["_verified_whatsapp_phone"] = phone
+                self.channel_outcome(result, "whatsapp", "available", reason)
+                return phone
+            saw_failure = saw_failure or state == "failed"
+            last_reason = reason or last_reason
+
+        status = "failed" if saw_failure else "not_on_whatsapp"
+        self.channel_outcome(
+            result,
+            "whatsapp",
+            status,
+            last_reason or "No discovered number is registered on WhatsApp",
+        )
+        return ""
+
+    def attempt_preferred_outreach(self, result, website, business_key):
+        """Use WhatsApp first and email only when WhatsApp cannot be used."""
+        verified = result.get("_verified_whatsapp_phone", "")
+        if not result.get("_whatsapp_attempted") and not verified:
+            verified = self.preflight_whatsapp(result, business_key)
+
+        email_recipients = self.email_recipients(result)
+        if not verified and not email_recipients:
+            self.channel_outcome(result, "email", "no_email", "No email address found")
+            return False
+
+        if not result.get("proposal"):
+            self._log("A deliverable contact channel was found; generating the outreach message.")
+            result["proposal"] = self.generate_website_proposal(website) or ""
+        if not result.get("proposal"):
+            return False
+
+        if verified and not result.get("_whatsapp_attempted"):
+            result["_whatsapp_attempted"] = True
+            sent = self.send_whatsapp_message(result, business_key)
+            if sent:
+                result["whatsapp_sent"] = True
+            status = result.get("channel_status", {}).get("whatsapp", {}).get("status")
+            if sent or status in {"uncertain", "review", "already_sent"}:
+                return sent
+
+        # SMTP is an exclusive fallback: it is never attempted after a
+        # confirmed or possibly-completed WhatsApp send.
+        if email_recipients:
+            sent = self.send_email_message(result, business_key)
+            if sent:
+                result["email_sent"] = True
+            return sent
+        return False
+
 
     def channel_image_path(self, section):
         if not self.get_bool_setting(section, "send_image", default=False):
@@ -2276,6 +2673,8 @@ class Automation(GoogleResultsMixin, OutreachChannelsMixin):
             result["status"] = "email_sent"
         elif result.get("whatsapp_sent"):
             result["status"] = "whatsapp_sent"
+        elif result.get("channel_status", {}).get("whatsapp", {}).get("status") == "not_on_whatsapp":
+            result["status"] = "not_on_whatsapp"
         else:
             result["status"] = "draft_ready" if result.get('proposal') else "draft_error"
 
@@ -2321,6 +2720,11 @@ class Automation(GoogleResultsMixin, OutreachChannelsMixin):
             "open_for_review",
             default=True
         )
+        reuse_tab = auto_send and self.get_bool_setting(
+            "whatsapp",
+            "reuse_tab",
+            default=True,
+        )
 
         if not auto_send and not open_for_review:
             return self.channel_outcome(result, "whatsapp", "review", "Auto send is off")
@@ -2346,8 +2750,16 @@ class Automation(GoogleResultsMixin, OutreachChannelsMixin):
 
         try:
             original_window = self.driver.current_window_handle
-            self.driver.switch_to.new_window("tab")
-            whatsapp_window = self.driver.current_window_handle
+            existing_whatsapp = getattr(self, "whatsapp_window", None)
+            if reuse_tab and existing_whatsapp in self.driver.window_handles:
+                whatsapp_window = existing_whatsapp
+                self.driver.switch_to.window(whatsapp_window)
+                self._log("Reusing the existing WhatsApp tab.")
+            else:
+                self.driver.switch_to.new_window("tab")
+                whatsapp_window = self.driver.current_window_handle
+                if reuse_tab:
+                    self.whatsapp_window = whatsapp_window
             self.driver.get(url)
 
             WebDriverWait(
@@ -2380,6 +2792,15 @@ class Automation(GoogleResultsMixin, OutreachChannelsMixin):
 
             if not send_button:
                 self.whatsapp_login_wait_used = True
+                unavailable_reason = self.whatsapp_unavailable_reason()
+                if unavailable_reason:
+                    self.dismiss_whatsapp_unavailable_dialog()
+                    return self.channel_outcome(
+                        result,
+                        'whatsapp',
+                        'not_on_whatsapp',
+                        unavailable_reason,
+                    )
                 return self.channel_outcome(result, 'whatsapp', 'failed', 'Chat not ready, number unavailable, or WhatsApp login required')
 
             self.whatsapp_login_wait_used = True
@@ -2401,6 +2822,16 @@ class Automation(GoogleResultsMixin, OutreachChannelsMixin):
                 recipient=phone
             )
             self._log("WhatsApp image sent." if image_path else "WhatsApp message sent.")
+            pause_min = max(0.0, float(self.get_section_setting(
+                "whatsapp", "send_pause_min_seconds", default=0
+            )))
+            pause_max = max(pause_min, float(self.get_section_setting(
+                "whatsapp", "send_pause_max_seconds", default=pause_min
+            )))
+            if pause_max:
+                delay = uniform(pause_min, pause_max)
+                self._log(f"Pausing {delay:.1f} seconds before the next WhatsApp contact.")
+                sleep(delay)
             return True
 
         except Exception as e:
@@ -2420,6 +2851,7 @@ class Automation(GoogleResultsMixin, OutreachChannelsMixin):
                     whatsapp_window
                     and whatsapp_window in self.driver.window_handles
                     and not keep_tab_open
+                    and not reuse_tab
                     and (message_sent or (auto_send and not result.get('_whatsapp_send_clicked')))
                 ):
                     self.driver.switch_to.window(
@@ -2487,15 +2919,68 @@ class Automation(GoogleResultsMixin, OutreachChannelsMixin):
                             return element
                 except Exception:
                     continue
+            # Stop waiting as soon as WhatsApp explicitly rejects the number.
+            if self.whatsapp_unavailable_reason(driver):
+                return "number-unavailable"
             return False
 
         try:
-            return WebDriverWait(
+            result = WebDriverWait(
                 self.driver,
                 timeout
             ).until(first_clickable)
+            return None if result == "number-unavailable" else result
         except TimeoutException:
             return None
+
+    def whatsapp_unavailable_reason(self, driver=None):
+        driver = driver or self.driver
+        try:
+            text = str(driver.execute_script(
+                "return (document.body && document.body.innerText || '').toLowerCase();"
+            ) or "").lower()
+        except Exception:
+            return ""
+
+        markers = (
+            "phone number shared via url is invalid",
+            "phone number isn't on whatsapp",
+            "phone number is not on whatsapp",
+            "not a valid whatsapp number",
+            "couldn't find this phone number",
+            "could not find this phone number",
+        )
+        dynamic_number_error = re.search(
+            r"\b(?:the\s+)?(?:phone\s+)?number\b.{0,60}\b(?:isn't|is not)\s+on\s+whatsapp\b",
+            text,
+            flags=re.DOTALL,
+        )
+        if any(marker in text for marker in markers) or dynamic_number_error:
+            return "Number is invalid or not registered on WhatsApp; skipped"
+        return ""
+
+    def dismiss_whatsapp_unavailable_dialog(self, driver=None):
+        """Close WhatsApp's invalid-number modal so the reused tab is ready."""
+        driver = driver or self.driver
+        selectors = (
+            (By.XPATH, "//*[@role='dialog']//*[@role='button' and normalize-space()='OK']"),
+            (By.XPATH, "//*[@role='dialog']//button[normalize-space()='OK']"),
+            (By.XPATH, "//*[@role='button' and normalize-space()='OK']"),
+            (By.XPATH, "//button[normalize-space()='OK']"),
+        )
+        for by, selector in selectors:
+            try:
+                for button in driver.find_elements(by, selector):
+                    if button.is_displayed() and button.is_enabled():
+                        try:
+                            button.click()
+                        except Exception:
+                            driver.execute_script("arguments[0].click();", button)
+                        self._log("WhatsApp invalid-number dialog dismissed; moving on.")
+                        return True
+            except Exception:
+                continue
+        return False
 
 
     def email_recipients(self, result):
@@ -2594,7 +3079,7 @@ class Automation(GoogleResultsMixin, OutreachChannelsMixin):
         subject = self.get_section_setting(
             "email",
             "subject",
-            default="Website development proposal"
+            default="Software and digital services proposal"
         )
 
         if not smtp_host or not from_email:
@@ -2728,6 +3213,18 @@ class Automation(GoogleResultsMixin, OutreachChannelsMixin):
         ):
             return False
 
+        campaign = self.config.get("campaign", {})
+        never_repeat = isinstance(campaign, dict) and bool(
+            campaign.get("never_repeat_contacted", True)
+        )
+        if never_repeat and self.db.execute(
+            """SELECT 1 FROM outreach_events
+               WHERE business_key=? AND event_type IN (?,?) LIMIT 1""",
+            (business_key, EVENT_WHATSAPP_SENT, EVENT_EMAIL_SENT),
+        ).fetchone():
+            self._log("Skipping business because a message was already sent previously.")
+            return True
+
         row = self.db.execute(
             "SELECT updated_at, status FROM outreach WHERE business_key = ?", (business_key,)
         ).fetchone()
@@ -2756,20 +3253,21 @@ class Automation(GoogleResultsMixin, OutreachChannelsMixin):
         self.db.execute(
             '''INSERT INTO outreach (
                 business_key, business_name, website, contact_page, emails,
-                phones, proposal, form_prefilled, status, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                phones, proposal, form_prefilled, status, updated_at, area_key
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(business_key) DO UPDATE SET
                 business_name=excluded.business_name, website=excluded.website,
                 contact_page=excluded.contact_page, emails=excluded.emails,
                 phones=excluded.phones, proposal=excluded.proposal,
                 form_prefilled=excluded.form_prefilled, status=excluded.status,
-                updated_at=excluded.updated_at''',
+                updated_at=excluded.updated_at,
+                area_key=CASE WHEN outreach.area_key='' THEN excluded.area_key ELSE outreach.area_key END''',
             (
                 business_key, result.get("name", ""), result.get("website", ""),
                 result.get("contact_page", ""), json.dumps(result.get("emails", [])),
                 json.dumps(result.get("phones", [])), result.get("proposal", ""),
                 int(result.get("form_prefilled", False)), result.get("status", "draft_ready"),
-                datetime.now().isoformat(timespec="seconds")
+                datetime.now().isoformat(timespec="seconds"), result.get("area_key", "")
             )
         )
         self.db.execute('UPDATE outreach SET channel_status=?,whatsapp_phones=?,last_error=? WHERE business_key=?',

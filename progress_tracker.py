@@ -35,7 +35,7 @@ def ensure_outreach_schema(connection: sqlite3.Connection) -> None:
         )"""
     )
     columns = {row[1] for row in connection.execute('PRAGMA table_info(outreach)')}
-    for name in ('channel_status', 'whatsapp_phones', 'last_error'):
+    for name in ('channel_status', 'whatsapp_phones', 'last_error', 'area_key'):
         if name not in columns:
             connection.execute(f"ALTER TABLE outreach ADD COLUMN {name} TEXT DEFAULT ''")
     connection.commit()
@@ -78,6 +78,32 @@ def ensure_progress_schema(connection: sqlite3.Connection) -> None:
         PRIMARY KEY (run_id, business_key))''')
     if 'pid' not in {row[1] for row in connection.execute('PRAGMA table_info(outreach_runs)')}:
         connection.execute('ALTER TABLE outreach_runs ADD COLUMN pid INTEGER')
+    event_columns = {row[1] for row in connection.execute('PRAGMA table_info(outreach_events)')}
+    if 'area_key' not in event_columns:
+        connection.execute("ALTER TABLE outreach_events ADD COLUMN area_key TEXT DEFAULT ''")
+    run_business_columns = {row[1] for row in connection.execute('PRAGMA table_info(run_businesses)')}
+    if 'area_key' not in run_business_columns:
+        connection.execute("ALTER TABLE run_businesses ADD COLUMN area_key TEXT DEFAULT ''")
+    connection.execute('''CREATE TABLE IF NOT EXISTS target_areas (
+        area_key TEXT PRIMARY KEY,
+        country TEXT NOT NULL,
+        region TEXT DEFAULT '',
+        city TEXT DEFAULT '',
+        area TEXT NOT NULL,
+        position INTEGER NOT NULL,
+        status TEXT NOT NULL DEFAULT 'pending',
+        attempt_count INTEGER NOT NULL DEFAULT 0,
+        last_query TEXT DEFAULT '',
+        businesses_found INTEGER NOT NULL DEFAULT 0,
+        businesses_processed INTEGER NOT NULL DEFAULT 0,
+        messages_sent INTEGER NOT NULL DEFAULT 0,
+        started_at TEXT DEFAULT '',
+        completed_at TEXT DEFAULT '',
+        updated_at TEXT DEFAULT '',
+        last_error TEXT DEFAULT ''
+    )''')
+    connection.execute('''CREATE INDEX IF NOT EXISTS idx_target_areas_queue
+                          ON target_areas(status,position)''')
     connection.commit()
 
 
@@ -101,8 +127,9 @@ def record_event(
     ensure_progress_schema(connection)
     cursor = connection.execute(
         """INSERT INTO outreach_events (
-            business_key, business_name, website, event_type, details, created_at, run_id, recipient
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            business_key, business_name, website, event_type, details, created_at,
+            run_id, recipient, area_key
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             business_key or "",
             str(result.get("name") or result.get("business_name") or ""),
@@ -112,6 +139,7 @@ def record_event(
             datetime.now().isoformat(timespec="seconds"),
             run_id if run_id is not None else result.get('run_id'),
             recipient,
+            str(result.get('area_key') or ''),
         ),
     )
     connection.commit()

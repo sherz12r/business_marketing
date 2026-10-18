@@ -17,6 +17,7 @@ from urllib.parse import quote_plus, urlparse
 import tkinter as tk
 
 from app_paths import get_app_dir
+from campaign import campaign_stats
 from process_utils import process_running
 from progress_tracker import (
     EVENT_EMAIL_SENT,
@@ -50,7 +51,7 @@ COLORS = {
     "white": "#ffffff",
 }
 
-DEFAULT_PROPOSAL_PROMPT = """You are helping a professional website development company
+DEFAULT_PROPOSAL_PROMPT = """You are helping a professional software and digital-services company
 write a short business introduction for a potential client.
 
 Business name:
@@ -84,12 +85,14 @@ IMPORTANT:
 - Do not mention that AI wrote the message.
 - Invite them to contact us if they are interested.
 - Mention that we can discuss their requirements and provide suitable recommendations.
-- Tailor the proposal to the business type. Mention all sender services that are
-  genuinely relevant to this specific business and explain their practical use.
-- Do not write a generic list or a general-purpose company introduction.
-- For a salon or beauty business, cover relevant needs such as a service and
-  appointment-booking website, POS, website updates and maintenance, local SEO,
-  digital marketing, business email, hosting, and suitable customer-management tools.
+- Infer the likely industry from the business name and profile context.
+- Mention only services that are genuinely relevant to that type of business,
+  such as website work, integrations, custom software, accounting, POS, CRM,
+  inventory, e-commerce, booking, automation, maintenance, SEO, or marketing.
+- Do not write a generic list or imply that every service is suitable.
+- If the target is itself a software, IT, web, advertising, or marketing
+  provider, treat it as a potential partner and propose collaboration rather
+  than selling website development or ordinary client services.
 - Do not include sender contact details such as contact name, email, phone, website, or a contact-us block.
 - Do not include a subject line unless specifically requested.
 
@@ -103,11 +106,21 @@ DEFAULT_CONFIG = {
     "limit": 10,
     "google_max_pages": 20,
     "openai_model": "gpt-5.5",
+    "use_browser_ai": False,
     "data_dir": "data",
     "review_mode": True,
     "keep_prefilled_tabs_open": True,
     "skip_previously_processed": True,
     "reprocess_after_days": 40,
+    "campaign": {
+        "enabled": False,
+        "country": "United Arab Emirates",
+        "locations_file": "locations/uae.json",
+        "query_template": "businesses in {area}, {city}, {region}, {country}",
+        "businesses_per_area": 25,
+        "max_areas_per_run": 1,
+        "never_repeat_contacted": True,
+    },
     "proposal_prompt": DEFAULT_PROPOSAL_PROMPT,
     "ignore_urls": [],
     "company_name": "",
@@ -125,6 +138,9 @@ DEFAULT_CONFIG = {
         "include_contact_details": True,
         "open_for_review": True,
         "keep_tabs_open": False,
+        "reuse_tab": True,
+        "send_pause_min_seconds": 12,
+        "send_pause_max_seconds": 25,
         "send_timeout_seconds": 30,
         "login_timeout_seconds": 180,
         "default_country_code": "971",
@@ -135,7 +151,7 @@ DEFAULT_CONFIG = {
     },
     "email": {
         "enabled": True,
-        "auto_send": False,
+        "auto_send": True,
         "include_contact_details": True,
         "smtp_host": "",
         "smtp_port": 587,
@@ -143,7 +159,7 @@ DEFAULT_CONFIG = {
         "smtp_password": "",
         "from_email": "",
         "from_name": "",
-        "subject": "Website development proposal",
+        "subject": "Software and digital services proposal",
         "send_to_all_found": False,
         "use_tls": True,
         "use_ssl": False,
@@ -172,9 +188,22 @@ SETTINGS_SECTIONS = [
         ],
     ),
     (
+        "Campaign",
+        [
+            {"path": ("campaign", "enabled"), "label": "Enable Area Campaign", "type": "bool"},
+            {"path": ("campaign", "country"), "label": "Country", "type": "text"},
+            {"path": ("campaign", "locations_file"), "label": "Locations Catalog", "type": "text"},
+            {"path": ("campaign", "query_template"), "label": "Google Query Template", "type": "text"},
+            {"path": ("campaign", "businesses_per_area"), "label": "New Businesses Per Area Attempt", "type": "int", "min": 1},
+            {"path": ("campaign", "max_areas_per_run"), "label": "Areas Per Run (0 = All)", "type": "int", "min": 0},
+            {"path": ("campaign", "never_repeat_contacted"), "label": "Never Repeat Contacted Businesses", "type": "bool"},
+        ],
+    ),
+    (
         "AI Prompt",
         [
             {"path": ("proposal_prompt",), "label": "Proposal Prompt", "type": "textarea", "height": 24},
+            {"path": ("use_browser_ai",), "label": "Use Browser AI When API Key Is Missing", "type": "bool"},
         ],
     ),
     (
@@ -210,6 +239,9 @@ SETTINGS_SECTIONS = [
             {"path": ("whatsapp", "include_contact_details"), "label": "Include Contact Details", "type": "bool"},
             {"path": ("whatsapp", "open_for_review"), "label": "Open For Review", "type": "bool"},
             {"path": ("whatsapp", "keep_tabs_open"), "label": "Keep Tabs Open", "type": "bool"},
+            {"path": ("whatsapp", "reuse_tab"), "label": "Reuse One WhatsApp Tab", "type": "bool"},
+            {"path": ("whatsapp", "send_pause_min_seconds"), "label": "Minimum Pause After Send", "type": "int", "min": 0},
+            {"path": ("whatsapp", "send_pause_max_seconds"), "label": "Maximum Pause After Send", "type": "int", "min": 0},
             {"path": ("whatsapp", "send_timeout_seconds"), "label": "Send Timeout Seconds", "type": "int", "min": 1},
             {"path": ("whatsapp", "login_timeout_seconds"), "label": "First Login Timeout Seconds", "type": "int", "min": 10},
             {"path": ("whatsapp", "default_country_code"), "label": "Default Country Code", "type": "text"},
@@ -1033,11 +1065,13 @@ class MarketingDashboard(tk.Tk):
 
     def fetch_stats(self, connection, rows):
         totals, run = outreach_stats(connection)
+        campaign = campaign_stats(connection)
         limit = max(1, int(run.get('target') or self.config_data.get('limit', 10)))
         processed = run.get('processed', 0)
         return {**totals, 'new': run.get('new',0), 'already_contacted': run.get('already_contacted',0),
                 'skipped': run.get('skipped',0), 'failed': run.get('failed',0),
-                'processed': processed, 'limit': limit, 'progress': min(100, processed / limit * 100), 'run': run}
+                'processed': processed, 'limit': limit, 'progress': min(100, processed / limit * 100),
+                'run': run, 'campaign': campaign}
 
     def fetch_activity(self, connection):
         return connection.execute(
@@ -1052,8 +1086,15 @@ class MarketingDashboard(tk.Tk):
             var.set(str(stats.get(key, 0)))
         self.progress_value.set(stats.get("progress", 0))
         run = stats.get('run', {})
+        campaign = stats.get('campaign', {})
+        current = campaign.get('current') or {}
+        campaign_line = (
+            f"Campaign: {campaign.get('completed',0)}/{campaign.get('total',0)} areas"
+            + (f" | {current.get('area','')}" if current else "")
+        )
         self.progress_text_var.set(
             f"{stats.get('processed', 0)} of {stats.get('limit', 0)} businesses processed\n"
+            f"{campaign_line}\n"
             f"Found: {run.get('found',0)} | Pages: {run.get('pages',0)}\n"
             f"Run WhatsApp: {run.get('whatsapp',0)} | Emails: {run.get('emails',0)}\n"
             f"Run websites: {run.get('websites',0)} | Forms: {run.get('forms',0)}\n"

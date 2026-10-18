@@ -17,6 +17,7 @@ from pathlib import Path
 from flask import Flask, Response, jsonify, render_template, request
 
 from app_paths import get_app_dir
+from campaign import campaign_stats, load_location_catalog, seed_target_areas
 from process_utils import process_running
 from progress_tracker import (
     EVENT_EMAIL_SENT,
@@ -137,15 +138,39 @@ def index():
 @require_auth
 def dashboard_data():
     with closing(database()) as connection:
+        config = load_config()
+        campaign_config = config.get("campaign", {})
+        if isinstance(campaign_config, dict) and campaign_config.get("enabled"):
+            try:
+                catalog_path = Path(campaign_config.get("locations_file", "locations/uae.json"))
+                if not catalog_path.is_absolute():
+                    catalog_path = APP_DIR / catalog_path
+                seed_target_areas(
+                    connection,
+                    load_location_catalog(
+                        catalog_path,
+                        country=str(campaign_config.get("country", "")),
+                    ),
+                )
+            except (OSError, ValueError, json.JSONDecodeError):
+                pass
         rows = connection.execute(
-            """SELECT o.*,
+            """SELECT o.*, t.country area_country, t.region area_region,
+                t.city area_city, t.area area_name,
                 MAX(CASE WHEN e.event_type = ? THEN e.created_at END) email_sent_at,
                 MAX(CASE WHEN e.event_type = ? THEN e.created_at END) whatsapp_sent_at
                FROM outreach o LEFT JOIN outreach_events e ON e.business_key=o.business_key
+               LEFT JOIN target_areas t ON t.area_key=o.area_key
               GROUP BY o.business_key ORDER BY COALESCE(o.updated_at, '') DESC LIMIT 250""",
             (EVENT_EMAIL_SENT, EVENT_WHATSAPP_SENT),
         ).fetchall()
         totals, run = outreach_stats(connection)
+        campaign = campaign_stats(connection)
+        areas = [dict(row) for row in connection.execute(
+            """SELECT position,country,region,city,area,status,businesses_found,
+                      businesses_processed,messages_sent,last_error
+               FROM target_areas ORDER BY country,position,area_key"""
+        ).fetchall()]
 
     leads = []
     for row in rows:
@@ -160,11 +185,16 @@ def dashboard_data():
             "form_prefilled": bool(row["form_prefilled"]),
             "last_error": row["last_error"] or "",
             "updated": row["updated_at"] or "",
+            "country": row["area_country"] or "",
+            "region": row["area_region"] or "",
+            "city": row["area_city"] or "",
+            "area": row["area_name"] or "",
             "email_sent": bool(row["email_sent_at"]) or row["status"] in {"email_sent", "fallback_sent"},
             "whatsapp_sent": bool(row["whatsapp_sent_at"]) or row["status"] in {"whatsapp_sent", "fallback_sent"},
         })
     stats = {**totals, "leads": totals['businesses']}
-    return jsonify({"stats": stats, "run": run, "leads": leads, "job": job_status()})
+    return jsonify({"stats": stats, "run": run, "campaign": campaign, "areas": areas,
+                    "leads": leads, "job": job_status()})
 
 
 

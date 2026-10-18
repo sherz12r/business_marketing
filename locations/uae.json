@@ -1,0 +1,149 @@
+{
+  "country": "United Arab Emirates",
+  "catalog_version": "2026-10",
+  "notes": "Ordered practical Google Business search zones. Edit this catalog as local districts change.",
+  "regions": [
+    {
+      "name": "Abu Dhabi",
+      "cities": [
+        {
+          "name": "Abu Dhabi",
+          "areas": [
+            "Abu Dhabi City Centre", "Al Bateen", "Al Danah", "Al Dhafrah", "Al Hosn",
+            "Al Khalidiyah", "Al Khubeirah", "Al Maqtaa", "Al Manhal", "Al Markaziyah",
+            "Al Maryah Island", "Al Mina", "Al Mushrif", "Al Muroor", "Al Nahyan",
+            "Al Raha Beach", "Al Rahba", "Al Rawdah", "Al Reem Island", "Al Reef",
+            "Al Rowdah", "Al Shahama", "Al Shamkha", "Al Wahda", "Al Zahiyah",
+            "Baniyas", "Khalifa City", "Madinat Zayed", "Masdar City", "Mohammed Bin Zayed City",
+            "Mussafah", "Rabdan", "Saadiyat Island", "Shakhbout City", "Yas Island",
+            "Zayed City"
+          ]
+        },
+        {
+          "name": "Al Ain",
+          "areas": [
+            "Al Ain Central District", "Al Bateen Al Ain", "Al Foah", "Al Hili", "Al Jimi",
+            "Al Khabisi", "Al Maqam", "Al Markhaniya", "Al Mutarad", "Al Muwaiji",
+            "Al Qattara", "Al Towayya", "Al Yahar", "Asharej", "Falaj Hazza",
+            "Zakher"
+          ]
+        },
+        {
+          "name": "Al Dhafra",
+          "areas": [
+            "Zayed City Al Dhafra", "Ghayathi", "Liwa", "Al Mirfa", "Al Sila",
+            "Delma Island", "Ruwais"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "Dubai",
+      "cities": [
+        {
+          "name": "Dubai",
+          "areas": [
+            "Abu Hail", "Al Awir", "Al Bada", "Al Barari", "Al Barsha 1", "Al Barsha 2",
+            "Al Barsha 3", "Al Barsha South", "Al Furjan", "Al Garhoud", "Al Hamriya Dubai",
+            "Al Jaddaf", "Al Jafiliya", "Al Karama", "Al Khawaneej", "Al Mizhar",
+            "Al Nahda Dubai", "Al Qusais", "Al Quoz", "Al Rashidiya", "Al Rigga",
+            "Al Safa", "Al Satwa", "Al Sufouh", "Al Twar", "Al Warqa", "Al Wasl",
+            "Arabian Ranches", "Barsha Heights", "Bluewaters Island", "Bur Dubai",
+            "Business Bay", "City Walk", "Damac Hills", "Deira", "Discovery Gardens",
+            "DIFC", "Downtown Dubai", "Dubai Design District", "Dubai Festival City",
+            "Dubai Healthcare City", "Dubai Hills Estate", "Dubai Internet City",
+            "Dubai Investment Park", "Dubai Marina", "Dubai Media City", "Dubai Silicon Oasis",
+            "Dubai South", "Dubai Sports City", "Emirates Hills", "Expo City Dubai",
+            "International City", "Jebel Ali", "Jumeirah 1", "Jumeirah 2", "Jumeirah 3",
+            "Jumeirah Beach Residence", "Jumeirah Golf Estates", "Jumeirah Lakes Towers",
+            "Jumeirah Village Circle", "Jumeirah Village Triangle", "Mirdif", "Motor City",
+            "Nad Al Hammar", "Nad Al Sheba", "Oud Metha", "Palm Jumeirah", "Ras Al Khor",
+            "Remraam", "The Greens", "The Lakes", "The Meadows", "The Springs",
+            "The Sustainable City", "Town Square Dubai", "Umm Al Sheif", "Umm Ramool",
+            "Umm Suqeim", "Warsan"
+          ]
+        },
+        {
+          "name": "Hatta",
+          "areas": ["Hatta"]
+        }
+      ]
+    },
+    {
+      "name": "Sharjah",
+      "cities": [
+        {
+          "name": "Sharjah",
+          "areas": [
+            "Abu Shagara", "Al Azra", "Al Bu Daniq", "Al Butina", "Al Darari", "Al Fayha",
+            "Al Ghubaiba Sharjah", "Al Gharayen", "Al Hazana", "Al Heerah", "Al Jazzat",
+            "Al Juraina", "Al Khan", "Al Layyah", "Al Majaz 1", "Al Majaz 2", "Al Majaz 3",
+            "Al Mamzar Sharjah", "Al Mareija", "Al Mirgab", "Al Nahda Sharjah", "Al Nasserya",
+            "Al Nekhailat", "Al Noaf", "Al Qasimia", "Al Qulayaah", "Al Rahmaniya",
+            "Al Ramla", "Al Rifah", "Al Sajaa", "Al Shahba", "Al Sharq", "Al Soor",
+            "Al Taawun", "Al Yarmook", "Industrial Area Sharjah", "Muwailih Commercial",
+            "Rolla", "University City Sharjah", "Wasit"
+          ]
+        },
+        {"name": "Khor Fakkan", "areas": ["Khor Fakkan"]},
+        {"name": "Kalba", "areas": ["Kalba"]},
+        {"name": "Dibba Al-Hisn", "areas": ["Dibba Al-Hisn"]},
+        {"name": "Al Dhaid", "areas": ["Al Dhaid"]}
+      ]
+    },
+    {
+      "name": "Ajman",
+      "cities": [
+        {
+          "name": "Ajman",
+          "areas": [
+            "Ajman City Centre", "Al Alia", "Al Bustan Ajman", "Al Hamidiya", "Al Helio",
+            "Al Jurf", "Al Mowaihat", "Al Nakhil Ajman", "Al Nuaimiya", "Al Rawda Ajman",
+            "Al Rashidiya Ajman", "Al Rumailah", "Al Tallah", "Emirates City Ajman",
+            "Industrial Area Ajman", "Masfout", "Al Manama Ajman"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "Ras Al Khaimah",
+      "cities": [
+        {
+          "name": "Ras Al Khaimah",
+          "areas": [
+            "Ras Al Khaimah City Centre", "Al Dhait", "Al Hamra Village", "Al Juwais",
+            "Al Mamourah RAK", "Al Marjan Island", "Al Nakheel RAK", "Al Qusaidat",
+            "Al Rams", "Al Refaa RAK", "Al Seer RAK", "Dafan Al Khor", "Julphar",
+            "Khuzam", "Mina Al Arab", "Shamal", "Wadi Ammar"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "Fujairah",
+      "cities": [
+        {
+          "name": "Fujairah",
+          "areas": [
+            "Fujairah City Centre", "Al Faseel", "Al Gurfa", "Al Hayl", "Al Mahatta",
+            "Al Owaid", "Al Taween", "Madhab", "Murbah", "Qidfa", "Sakamkam"
+          ]
+        },
+        {"name": "Dibba Al-Fujairah", "areas": ["Dibba Al-Fujairah"]}
+      ]
+    },
+    {
+      "name": "Umm Al Quwain",
+      "cities": [
+        {
+          "name": "Umm Al Quwain",
+          "areas": [
+            "Umm Al Quwain City Centre", "Al Dar Al Baida", "Al Haditha", "Al Humrah",
+            "Al Maqtaa Umm Al Quwain", "Al Raas", "Al Salamah", "Emirates Modern Industrial Area",
+            "Falaj Al Mualla", "Old Town Umm Al Quwain"
+          ]
+        }
+      ]
+    }
+  ]
+}

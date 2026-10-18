@@ -9,6 +9,7 @@ from datetime import datetime
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+from campaign import load_location_catalog, seed_target_areas
 from main import Automation
 from progress_tracker import ensure_database, outreach_stats, record_event
 import web_app
@@ -23,6 +24,7 @@ class OutreachTests(unittest.TestCase):
         self.addCleanup(lambda: shutil.rmtree(work))
         self.bot = Automation.__new__(Automation)
         self.bot.config = {'limit': 10, 'google_max_pages': 8, 'reprocess_after_days': 40,
+                           'use_browser_ai': True,
                            'email': {'enabled': True, 'auto_send': True, 'smtp_host': 'smtp.test',
                                      'from_email': 'sender@example.test', 'smtp_username': '',
                                      'smtp_password': '', 'include_contact_details': False},
@@ -42,6 +44,15 @@ class OutreachTests(unittest.TestCase):
         self.bot._log = MagicMock()
         self.bot.random_sleep = MagicMock()
         self.bot.whatsapp_login_wait_used = True
+        self.bot.whatsapp_window = None
+        def available_whatsapp(result, _business_key):
+            _numbers, _usable, candidates = self.bot.whatsapp_candidates(result)
+            if not candidates:
+                return ''
+            result['_verified_whatsapp_phone'] = candidates[0]
+            return candidates[0]
+        self.bot.preflight_whatsapp = MagicMock(side_effect=available_whatsapp)
+        self.bot.current_area = {}
         self.bot.search_query = 'salons'
         self.bot.headless = True
         self.bot.limit = 10
@@ -116,6 +127,41 @@ class OutreachTests(unittest.TestCase):
         self.assertEqual(self.bot.unwrap_google_url('/goto?url=https%3A%2F%2Fsalon.test'), 'https://salon.test')
         self.assertEqual(self.bot.unwrap_google_url('https://www.google.com/maps'), '')
 
+    def test_opaque_google_website_redirect_is_deferred(self):
+        self.bot.resolve_google_website=MagicMock()
+        self.assertEqual(self.bot.unwrap_google_url('/goto?cid=123'), '')
+        self.bot.resolve_google_website.assert_not_called()
+
+    def test_google_redirect_self_closed_tab_restores_results_window(self):
+        class SelfClosingDriver:
+            def __init__(self):
+                self.handles=['google'];self.active='google';self.switch_to=self.Switch(self)
+            class Switch:
+                def __init__(self,driver): self.driver=driver
+                def new_window(self,_kind):
+                    self.driver.handles.append('temporary');self.driver.active='temporary'
+                def window(self,handle):
+                    if handle not in self.driver.handles: raise RuntimeError('missing window')
+                    self.driver.active=handle
+            @property
+            def current_window_handle(self):
+                if self.active not in self.handles: raise RuntimeError('target window already closed')
+                return self.active
+            @property
+            def window_handles(self): return self.handles[:]
+            @property
+            def current_url(self):
+                if self.active not in self.handles: raise RuntimeError('target window already closed')
+                return 'https://www.google.com/search?q=salon'
+            def get(self,_url):
+                self.handles.remove(self.active)
+            def close(self):
+                self.handles.remove(self.active)
+
+        self.bot.driver=SelfClosingDriver()
+        self.assertIsNone(self.bot.resolve_google_website('https://www.google.com/goto?cid=123'))
+        self.assertEqual(self.bot.driver.current_window_handle,'google')
+
     def test_snapshot_merges_duplicate_domain_contacts(self):
         self.bot.driver.execute_script.return_value=[
             {'name':'Salon','url':'/url?q=https%3A%2F%2Fsalon.test','phones':['0501112222']},
@@ -143,13 +189,169 @@ class OutreachTests(unittest.TestCase):
         saved=json.loads(self.bot.db.execute('SELECT channel_status FROM outreach').fetchone()[0])
         self.assertEqual(saved['whatsapp']['status'],'failed')
 
-    def test_no_website_still_attempts_both_channels(self):
+    def test_google_profile_phone_uses_whatsapp_without_opening_website(self):
         self.bot.generate_website_proposal=MagicMock(return_value='Hello')
         self.bot.send_whatsapp_message=MagicMock(return_value=True)
-        self.bot.send_email_message=MagicMock(return_value=False)
-        self.bot.process_website({'name':'Phone only','phones':['0501112222']})
+        self.bot.open_website=MagicMock()
+        self.bot.process_website({'name':'Profile phone','url':'https://fixture.test','phones':['0501112222']})
         self.bot.send_whatsapp_message.assert_called_once()
+        self.bot.open_website.assert_not_called()
+
+    def test_no_website_profile_phone_gets_website_development_message(self):
+        self.bot.ask_ai=MagicMock(return_value='Hello')
+        self.bot.send_whatsapp_message=MagicMock(return_value=True)
+        self.bot.process_website({'name':'Phone only','phones':['0501112222']})
+        prompt=self.bot.ask_ai.call_args.args[0]
+        self.assertIn('no website listed',prompt.lower())
+        self.assertIn('creating a new professional business website',prompt.lower())
+
+    def test_existing_website_gets_general_message_rule(self):
+        self.bot.ask_ai=MagicMock(return_value='Hello')
+        self.bot.send_whatsapp_message=MagicMock(return_value=True)
+        self.bot.process_website({'name':'Has site','url':'https://fixture.test','phones':['0501112222']})
+        prompt=self.bot.ask_ai.call_args.args[0]
+        self.assertIn('already has a website listed',prompt.lower())
+        self.assertIn('do not propose building a new website',prompt.lower())
+
+    def test_software_company_gets_partnership_prompt_not_website_pitch(self):
+        self.bot.ask_ai = MagicMock(return_value='Partnership message')
+        message = self.bot.generate_website_proposal({
+            'name':'Acme Software Development',
+            'profile_text':'Software company in Dubai',
+        })
+        prompt = self.bot.ask_ai.call_args.args[0].lower()
+        self.assertEqual(message, 'Partnership message')
+        self.assertIn('partnership outreach requirement', prompt)
+        self.assertIn('reciprocal referrals', prompt)
+        self.assertIn('do not pitch website creation', prompt)
+        self.assertNotIn('clearly and politely propose creating a new professional business website', prompt)
+
+    def test_marketing_agency_local_message_proposes_collaboration(self):
+        self.bot.config['use_browser_ai'] = False
+        self.bot.ask_ai = MagicMock()
+        message = self.bot.generate_website_proposal({
+            'name':'Bright Digital Marketing Agency',
+            'profile_text':'Marketing agency and advertising service',
+        })
+        self.bot.ask_ai.assert_not_called()
+        self.assertIn('business opportunity', message.lower())
+        self.assertIn('reciprocal referrals', message.lower())
+        self.assertIn('white-label', message.lower())
+        self.assertNotIn('does not currently show a website', message.lower())
+
+    def test_ordinary_business_is_not_classified_as_similar_provider(self):
+        self.assertFalse(self.bot.is_similar_service_business({
+            'name':'Garden Restaurant',
+            'profile_text':'Restaurant with social media pages and online booking',
+        }))
+
+    def test_ai_failure_uses_local_message_and_continues_to_whatsapp(self):
+        self.bot.ask_ai=MagicMock(side_effect=RuntimeError('AI unavailable'))
+        self.bot.send_whatsapp_message=MagicMock(return_value=True)
+        result=self.bot.process_website({'name':'Fallback Salon','url':'https://fixture.test','phones':['0501112222']})
+        self.bot.send_whatsapp_message.assert_called_once()
+        self.assertIn('digital presence',result['proposal'].lower())
+        self.assertNotIn('create a professional, mobile-friendly website',result['proposal'].lower())
+
+    def test_ai_failure_without_website_uses_development_fallback(self):
+        self.bot.ask_ai=MagicMock(side_effect=RuntimeError('AI unavailable'))
+        self.bot.send_whatsapp_message=MagicMock(return_value=True)
+        result=self.bot.process_website({'name':'Fallback Salon','phones':['0501112222']})
+        self.assertIn('does not currently show a website',result['proposal'].lower())
+        self.assertIn('create a professional, mobile-friendly website',result['proposal'].lower())
+
+    def test_invalid_whatsapp_without_email_does_not_generate_message(self):
+        def unavailable(result, _business_key):
+            result.setdefault('channel_status', {})['whatsapp'] = {
+                'status': 'not_on_whatsapp', 'reason': 'not registered'
+            }
+            return ''
+        self.bot.preflight_whatsapp = MagicMock(side_effect=unavailable)
+        self.bot.generate_website_proposal = MagicMock(return_value='Should not be generated')
+        result = self.bot.process_website({'name':'Phone only','phones':['0501112222']})
+        self.bot.preflight_whatsapp.assert_called_once()
+        self.bot.generate_website_proposal.assert_not_called()
+        self.assertFalse(result['proposal'])
+        self.assertEqual(result['channel_status']['email']['status'], 'no_email')
+
+    def test_invalid_whatsapp_falls_back_to_email_found_on_website(self):
+        self.bot.preflight_whatsapp = MagicMock(return_value='')
+        self.bot.open_website = MagicMock(return_value={'window_handle':'site','original_window':'google'})
+        self.bot.find_emails = MagicMock(return_value=['hello@fixture.test'])
+        self.bot.find_phone_numbers = MagicMock(return_value=[])
+        self.bot.find_whatsapp_numbers = MagicMock(return_value=[])
+        self.bot.find_contact_page = MagicMock(return_value=None)
+        self.bot.generate_website_proposal = MagicMock(return_value='Hello by email')
+        self.bot.send_whatsapp_message = MagicMock()
+        self.bot.send_email_message = MagicMock(return_value=True)
+        self.bot.fill_contact_form = MagicMock(return_value=False)
+
+        result = self.bot.process_website({
+            'name':'Email fallback', 'url':'https://fixture.test', 'phones':['0501112222']
+        })
+
+        self.bot.generate_website_proposal.assert_called_once()
+        self.bot.send_whatsapp_message.assert_not_called()
         self.bot.send_email_message.assert_called_once()
+        self.assertTrue(result['email_sent'])
+
+    def test_website_without_working_whatsapp_or_email_skips_message_generation(self):
+        self.bot.preflight_whatsapp = MagicMock(return_value='')
+        self.bot.open_website = MagicMock(return_value={'window_handle':'site','original_window':'google'})
+        self.bot.find_emails = MagicMock(return_value=[])
+        self.bot.find_phone_numbers = MagicMock(return_value=[])
+        self.bot.find_whatsapp_numbers = MagicMock(return_value=[])
+        self.bot.find_contact_page = MagicMock(return_value=None)
+        self.bot.generate_website_proposal = MagicMock(return_value='Should not be generated')
+        result = self.bot.process_website({'name':'No channel','url':'https://fixture.test'})
+        self.bot.generate_website_proposal.assert_not_called()
+        self.assertFalse(result['proposal'])
+
+    def test_whatsapp_preflight_reuses_tab_and_opens_no_message_text(self):
+        element = MagicMock()
+        element.is_displayed.return_value = True
+        self.bot.whatsapp_window = 'wa'
+        self.bot.driver.current_window_handle = 'google'
+        self.bot.driver.window_handles = ['google', 'wa']
+        self.bot.driver.find_elements.return_value = [element]
+        self.bot.whatsapp_unavailable_reason = MagicMock(return_value='')
+
+        state, _reason = self.bot.check_whatsapp_phone('971501112222')
+
+        self.assertEqual(state, 'available')
+        self.bot.driver.switch_to.new_window.assert_not_called()
+        self.bot.driver.get.assert_called_once_with(
+            'https://web.whatsapp.com/send?phone=971501112222'
+        )
+        self.assertNotIn('text=', self.bot.driver.get.call_args.args[0])
+
+    def test_current_whatsapp_invalid_number_text_is_detected(self):
+        self.bot.driver.execute_script.return_value = (
+            "The number +971 2 678 9808 isn't on WhatsApp. OK"
+        )
+        self.assertTrue(self.bot.whatsapp_unavailable_reason())
+
+    def test_invalid_number_preflight_dismisses_dialog_immediately(self):
+        self.bot.whatsapp_window = 'wa'
+        self.bot.driver.current_window_handle = 'google'
+        self.bot.driver.window_handles = ['google', 'wa']
+        self.bot.whatsapp_unavailable_reason = MagicMock(
+            return_value='Number is invalid or not registered on WhatsApp; skipped'
+        )
+        self.bot.dismiss_whatsapp_unavailable_dialog = MagicMock(return_value=True)
+
+        state, _reason = self.bot.check_whatsapp_phone('97126789808')
+
+        self.assertEqual(state, 'not_on_whatsapp')
+        self.bot.dismiss_whatsapp_unavailable_dialog.assert_called_once_with(self.bot.driver)
+
+    def test_local_message_mode_does_not_open_browser_ai(self):
+        self.bot.config['use_browser_ai']=False
+        self.bot.ask_ai=MagicMock()
+        message=self.bot.generate_website_proposal({'name':'General Trading','url':'https://fixture.test'})
+        self.bot.ask_ai.assert_not_called()
+        self.assertIn('custom software',message.lower())
+        self.assertIn('accounting',message.lower())
 
     def prepare_website(self):
         self.bot.open_website=MagicMock(return_value={'window_handle':'site','original_window':'google'})
@@ -158,28 +360,32 @@ class OutreachTests(unittest.TestCase):
         self.bot.find_whatsapp_numbers=MagicMock(return_value=['0505556666'])
         self.bot.find_contact_page=MagicMock(return_value=None)
         self.bot.generate_website_proposal=MagicMock(return_value='Hello')
-        self.bot.run_fallback_channels=MagicMock()
+        self.bot.send_whatsapp_message=MagicMock(return_value=True)
+        self.bot.send_email_message=MagicMock(return_value=True)
 
-    def test_form_exception_does_not_block_outreach_and_google_phone_is_retained(self):
+    def test_form_exception_does_not_block_outreach_and_site_phones_are_retained(self):
         self.prepare_website()
         self.bot.fill_contact_form=MagicMock(side_effect=RuntimeError('Form broke'))
-        result=self.bot.process_website({'name':'Salon','url':'https://fixture.test','phones':['0501112222']})
-        self.bot.run_fallback_channels.assert_called_once()
-        self.assertEqual(set(result['phones']),{'0501112222','0503334444','0505556666'})
+        result=self.bot.process_website({'name':'Salon','url':'https://fixture.test'})
+        self.bot.send_whatsapp_message.assert_called_once()
+        self.bot.send_email_message.assert_not_called()
+        self.assertEqual(set(result['phones']),{'0503334444','0505556666'})
 
     def test_filled_form_still_runs_outreach(self):
         self.prepare_website();self.bot.fill_contact_form=MagicMock(return_value=True)
         result=self.bot.process_website({'name':'Salon','url':'https://fixture.test'})
         self.assertTrue(result['form_prefilled'])
-        self.bot.run_fallback_channels.assert_called_once()
+        self.bot.send_whatsapp_message.assert_called_once()
+        self.bot.send_email_message.assert_not_called()
         self.assertEqual(outreach_stats(self.bot.db)[0]['forms'],1)
 
-    def test_failed_website_uses_google_phone(self):
+    def test_google_phone_is_used_before_failed_website(self):
         self.bot.open_website=MagicMock(return_value=None)
         self.bot.generate_website_proposal=MagicMock(return_value='Hello')
-        self.bot.run_fallback_channels=MagicMock()
+        self.bot.send_whatsapp_message=MagicMock(return_value=False)
         result=self.bot.process_website({'name':'Unavailable','url':'https://fixture.test','phones':['0501112222']})
-        self.bot.run_fallback_channels.assert_called_once()
+        self.bot.send_whatsapp_message.assert_called_once()
+        self.bot.open_website.assert_called_once()
         self.assertEqual(result['status'],'website_error')
 
     def test_form_requires_message_field(self):
@@ -194,6 +400,42 @@ class OutreachTests(unittest.TestCase):
         self.assertTrue(self.bot.send_whatsapp_message(result,'key'))
         self.assertEqual(self.bot._send_whatsapp_to_phone.call_count,2)
         self.assertEqual(result['phones'],['0501112222','0503334444'])
+
+    def test_not_on_whatsapp_is_a_skip_status(self):
+        result=self.lead()
+        self.bot.find_whatsapp_send_button=MagicMock(return_value=None)
+        self.bot.whatsapp_unavailable_reason=MagicMock(return_value='Number is not registered')
+        self.assertFalse(self.bot.send_whatsapp_message(result,'key'))
+        self.assertEqual(result['channel_status']['whatsapp']['status'],'not_on_whatsapp')
+        self.bot.update_result_status(result)
+        self.assertEqual(result['status'],'not_on_whatsapp')
+
+    def test_same_whatsapp_recipient_is_never_contacted_twice(self):
+        record_event(self.bot.db,'whatsapp_sent','first',recipient='971501112222')
+        self.bot._send_whatsapp_to_phone=MagicMock()
+        result=self.lead(name='Different listing')
+        self.assertFalse(self.bot.send_whatsapp_message(result,'second'))
+        self.bot._send_whatsapp_to_phone.assert_not_called()
+        self.assertEqual(result['channel_status']['whatsapp']['status'],'duplicate_recipient')
+
+    def test_uncertain_whatsapp_recipient_is_not_retried_under_another_listing(self):
+        record_event(self.bot.db,'whatsapp_uncertain','first',recipient='971501112222')
+        self.bot._send_whatsapp_to_phone=MagicMock()
+        result=self.lead(name='Alternate listing name')
+        self.assertFalse(self.bot.send_whatsapp_message(result,'second'))
+        self.bot._send_whatsapp_to_phone.assert_not_called()
+        self.assertEqual(result['channel_status']['whatsapp']['status'],'duplicate_recipient')
+
+    def test_whatsapp_reuses_existing_tab(self):
+        self.bot.whatsapp_window='wa'
+        self.bot.driver.current_window_handle='google'
+        self.bot.driver.window_handles=['google','wa']
+        self.bot.find_whatsapp_send_button=MagicMock(return_value=MagicMock())
+        self.bot.whatsapp_outgoing_ids=MagicMock(return_value=[])
+        self.bot.wait_for_whatsapp_confirmation=MagicMock(return_value=True)
+        self.assertTrue(self.bot._send_whatsapp_to_phone(self.lead(),'key'))
+        self.bot.driver.switch_to.new_window.assert_not_called()
+        self.bot.driver.get.assert_called_once()
 
     def test_whatsapp_cooldown_protects_against_interrupted_save(self):
         record_event(self.bot.db,'whatsapp_sent','key',recipient='971501112222')
@@ -220,6 +462,17 @@ class OutreachTests(unittest.TestCase):
         self.bot.wait_for_whatsapp_confirmation=MagicMock(return_value=True)
         self.assertTrue(self.bot.send_whatsapp_message(self.lead(),'key'))
         self.assertEqual(outreach_stats(self.bot.db)[1]['whatsapp'],1)
+
+    def test_confirmed_send_is_linked_to_campaign_area(self):
+        self.bot.find_whatsapp_send_button=MagicMock(return_value=MagicMock())
+        self.bot.whatsapp_outgoing_ids=MagicMock(return_value=[])
+        self.bot.wait_for_whatsapp_confirmation=MagicMock(return_value=True)
+        result=self.lead();result['area_key']='area-1'
+        self.assertTrue(self.bot.send_whatsapp_message(result,'key'))
+        self.assertEqual(
+            self.bot.db.execute("SELECT area_key FROM outreach_events WHERE event_type='whatsapp_sent'").fetchone()[0],
+            'area-1'
+        )
 
     def smtp(self, refused=None):
         smtp=patch('main.smtplib.SMTP').start()
@@ -275,6 +528,8 @@ class OutreachTests(unittest.TestCase):
         self.assertEqual(response.status_code,200)
         self.assertEqual(response.json['stats']['leads'],260)
         self.assertEqual(len(response.json['leads']),250)
+        self.assertGreaterEqual(response.json['campaign']['total'],150)
+        self.assertEqual(len(response.json['areas']),response.json['campaign']['total'])
         self.assertIn('no-store',response.headers['Cache-Control'])
 
     def test_pending_email_works_after_schema_migration(self):
@@ -293,6 +548,57 @@ class OutreachTests(unittest.TestCase):
             Automation(mode='pending-email')
         self.assertTrue(Path(read.call_args.args[0]).is_absolute())
         launch.assert_not_called()
+
+    def test_uae_catalog_has_seven_emirates_and_unique_ordered_areas(self):
+        catalog=Path(__file__).resolve().parents[1]/'locations'/'uae.json'
+        locations=load_location_catalog(catalog)
+        self.assertGreaterEqual(len(locations),150)
+        self.assertEqual(len({item['area_key'] for item in locations}),len(locations))
+        self.assertEqual({item['region'] for item in locations},{
+            'Abu Dhabi','Dubai','Sharjah','Ajman','Ras Al Khaimah','Fujairah','Umm Al Quwain'
+        })
+        self.assertEqual([item['position'] for item in locations],list(range(1,len(locations)+1)))
+
+    def test_area_queue_is_idempotent_and_marks_exhausted_area_complete(self):
+        catalog=self.bot.data_dir/'locations.json'
+        catalog.write_text(json.dumps({
+            'country':'Testland','regions':[{'name':'North','cities':[{'name':'City','areas':['Area A']}]}]
+        }),encoding='utf-8')
+        locations=load_location_catalog(catalog)
+        self.assertEqual(seed_target_areas(self.bot.db,locations),1)
+        self.assertEqual(seed_target_areas(self.bot.db,locations),0)
+        self.bot.search_business=MagicMock(return_value=self.bot.driver)
+        def process(*_args,**_kwargs):
+            self.bot.last_search_outcome={'status':'completed','reason':'No next Google page or additional business results'}
+            return []
+        self.bot.process_all_websites=MagicMock(side_effect=process)
+        self.bot.run_location_campaign({
+            'country':'Testland','locations_file':str(catalog),
+            'query_template':'businesses in {area}, {city}, {country}',
+            'businesses_per_area':10,'max_areas_per_run':1,
+        })
+        row=self.bot.db.execute('SELECT status,last_query,attempt_count FROM target_areas').fetchone()
+        self.assertEqual(row['status'],'completed')
+        self.assertEqual(row['last_query'],'businesses in Area A, City, Testland')
+        self.assertEqual(row['attempt_count'],1)
+
+    def test_area_stays_in_progress_when_business_attempt_limit_is_reached(self):
+        catalog=self.bot.data_dir/'locations.json'
+        catalog.write_text(json.dumps({
+            'country':'Testland','regions':[{'name':'North','cities':[{'name':'City','areas':['Area A','Area B']}]}]
+        }),encoding='utf-8')
+        self.bot.search_business=MagicMock(return_value=self.bot.driver)
+        def process(*_args,**_kwargs):
+            self.bot.last_search_outcome={'status':'completed','reason':'Configured business limit reached'}
+            return []
+        self.bot.process_all_websites=MagicMock(side_effect=process)
+        self.bot.run_location_campaign({
+            'country':'Testland','locations_file':str(catalog),
+            'businesses_per_area':10,'max_areas_per_run':2,
+        })
+        statuses=dict(self.bot.db.execute('SELECT area,status FROM target_areas'))
+        self.assertEqual(statuses,{'Area A':'in_progress','Area B':'pending'})
+        self.bot.process_all_websites.assert_called_once()
 
 
 if __name__ == '__main__':

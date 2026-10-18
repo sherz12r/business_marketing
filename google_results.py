@@ -75,7 +75,12 @@ class GoogleResultsMixin:
             if target:
                 value = target
             elif parsed.path == '/goto':
-                return self.resolve_google_website(value) or ''
+                # Some Google Business "Website" buttons use an opaque /goto
+                # URL.  Do not visit every business website while collecting
+                # the search results.  Keep the redirect and resolve it only
+                # when the listing has no Google-profile phone and website
+                # contact discovery is actually required.
+                return ''
             else:
                 return ''
         return ''
@@ -85,17 +90,26 @@ class GoogleResultsMixin:
         snapshot = page.execute_script(SNAPSHOT_SCRIPT) or []
         found = {}
         for item in snapshot:
-            url = self.unwrap_google_url(item.get('url', '')) if item.get('url') else ''
+            raw_url = (item.get('url') or '').strip()
+            url = self.unwrap_google_url(raw_url) if raw_url else ''
             if url and self.is_ignored_url(url):
                 continue
             name = (item.get('name') or '').strip()
             if not url and not name:
                 continue
             candidate = dict(name=name, url=url, detail_url=item.get('detail_url', ''),
+                             has_website=bool(raw_url),
+                             website_redirect_url=raw_url if raw_url and not url else '',
+                             profile_text=(item.get('text') or '')[:1200],
                              phones=list(dict.fromkeys(item.get('phones', []) + self.extract_phone_numbers(item.get('text', '')))))
             key = self.business_key(candidate)
             if key in found:
                 found[key]['phones'] = list(dict.fromkeys(found[key]['phones'] + candidate['phones']))
+                found[key]['has_website'] = found[key].get('has_website', False) or candidate['has_website']
+                found[key]['website_redirect_url'] = (
+                    found[key].get('website_redirect_url') or candidate['website_redirect_url']
+                )
+                found[key]['detail_url'] = found[key].get('detail_url') or candidate['detail_url']
             else:
                 found[key] = candidate
         return list(found.values())
@@ -103,7 +117,12 @@ class GoogleResultsMixin:
     def enrich_google_business(self, website):
         """Read the selected business listing when its card hides website/phone details."""
         detail = website.get('detail_url')
-        if not detail or (website.get('url') and website.get('phones')):
+        has_website = bool(
+            website.get('url')
+            or website.get('has_website')
+            or website.get('website_redirect_url')
+        )
+        if not detail or (has_website and website.get('phones')):
             return website
         original = self.driver.current_window_handle
         detail_window = None
@@ -121,7 +140,13 @@ class GoogleResultsMixin:
                 return {url:site?.href || '', phones};
             """) or {}
             if info.get('url'):
-                website['url'] = self.unwrap_google_url(info['url']) or website.get('url', '')
+                raw_url = info['url']
+                resolved_url = self.unwrap_google_url(raw_url)
+                website['has_website'] = True
+                if resolved_url:
+                    website['url'] = resolved_url
+                else:
+                    website['website_redirect_url'] = raw_url
             website['phones'] = list(dict.fromkeys(website.get('phones', []) + info.get('phones', [])))
         except Exception as exc:
             self._log(f'Could not expand business details: {exc}')
