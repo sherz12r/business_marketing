@@ -94,8 +94,10 @@ IMPORTANT:
   provider, treat it as a potential partner and propose collaboration rather
   than selling website development or ordinary client services.
 - When confirmed website-audit observations are provided, mention only those
-  observations, do not invent vulnerabilities, and say that we can fix them
-  without giving a detailed technical solution.
+  observations as internal evidence, but describe them to the customer only
+  as broad improvement areas such as SEO, accessibility, mobile usability, or
+  website security. Do not reveal exact issues, element names, or counts, and
+  do not give a detailed technical solution.
 - Do not include sender contact details such as contact name, email, phone, website, or a contact-us block.
 - Do not include a subject line unless specifically requested.
 

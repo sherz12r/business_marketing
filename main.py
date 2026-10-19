@@ -97,8 +97,10 @@ IMPORTANT:
   provider, treat it as a potential partner and propose collaboration rather
   than selling website development or ordinary client services.
 - When confirmed website-audit observations are provided, mention only those
-  observations, do not invent vulnerabilities, and say that we can fix them
-  without giving a detailed technical solution.
+  observations as internal evidence, but describe them to the customer only
+  as broad improvement areas such as SEO, accessibility, mobile usability, or
+  website security. Do not reveal exact issues, element names, or counts, and
+  do not give a detailed technical solution.
 - Do not include sender contact details such as contact name, email, phone, website, or a contact-us block.
 - Do not include a subject line unless specifically requested.
 
@@ -1358,8 +1360,8 @@ class Automation(GoogleResultsMixin, OutreachChannelsMixin):
                         f"Contact page error: {e}"
                     )
 
-            # Validate WhatsApp first. Only after a usable WhatsApp chat or an
-            # email address is found do we spend time creating the message.
+            # Prepare every channel supported by this lead. A website can use
+            # its contact form even when no email address is discovered.
             try:
                 self.attempt_preferred_outreach(result, website, business_key)
 
@@ -2302,13 +2304,19 @@ class Automation(GoogleResultsMixin, OutreachChannelsMixin):
             prompt += f"\n\nWEBSITE REVIEW:\nWebsite checked: {website_url or 'Website URL listed on Google'}"
             if audit_findings:
                 prompt += (
-                    "\nConfirmed homepage observations:\n"
+                    "\nInternal homepage observations (for grounding only; do not quote, "
+                    "list, or expose these details to the customer):\n"
                     + "\n".join(f"- {finding}" for finding in audit_findings)
-                    + "\n\nWrite a concise outreach message that mentions two to four of "
-                    "these confirmed observations and their likely business impact. Do "
-                    "not provide the full technical solution or step-by-step instructions; "
-                    "simply explain that our team can fix the identified website issues "
-                    "and invite them to discuss the work. Do not invent additional issues. "
+                    + "\n\nWrite a concise outreach message that summarizes the review only "
+                    "in broad customer-friendly terms, such as opportunities to improve "
+                    "SEO/search visibility, accessibility, mobile usability, or website "
+                    "security and trust, but only when supported by the internal observations. "
+                    "Do not mention exact issues, HTML tags or attributes, metadata names, "
+                    "protocols, technical checks, individual affected items, or any counts. "
+                    "Do not list the findings and do not provide a technical solution or "
+                    "step-by-step instructions. Simply explain that our team can review and "
+                    "fix the relevant website areas and invite them to discuss the work. "
+                    "Do not invent additional issue categories. "
                     "Do not claim the site is hacked, vulnerable, unsafe, penalized, or "
                     "non-responsive unless the confirmed observations explicitly prove it."
                 )
@@ -2328,9 +2336,9 @@ class Automation(GoogleResultsMixin, OutreachChannelsMixin):
             )
         elif has_website:
             prompt += (
-                "\n\nKeep the message focused on the confirmed website observations. "
-                "Do not replace them with a generic list of our services and do not "
-                "include a technical tutorial."
+                "\n\nKeep the message focused on the broad website improvement areas "
+                "supported by the review. Do not expose the underlying observations, "
+                "replace them with a generic list of our services, or include a technical tutorial."
             )
         else:
             prompt += (
@@ -2366,11 +2374,17 @@ class Automation(GoogleResultsMixin, OutreachChannelsMixin):
             return self.fallback_outreach_message(website)
 
         try:
-            return self.ask_ai(
+            message = self.ask_ai(
                 prompt,
                 domain=company_name,
                 filename="proposal"
             )
+            if audit_findings and self.audit_message_exposes_details(message):
+                self._log(
+                    "AI draft exposed technical audit details; using the general customer summary."
+                )
+                return self.fallback_outreach_message(website)
+            return message
         except Exception as exc:
             # Outreach should not stop solely because the optional AI service
             # or browser session is unavailable.  The local template preserves
@@ -2407,15 +2421,18 @@ class Automation(GoogleResultsMixin, OutreachChannelsMixin):
                 if str(finding).strip()
             ][:4]
             if findings:
-                observations = "\n".join(f"- {finding}" for finding in findings)
+                improvement_areas = self.audit_improvement_areas(findings)
+                if len(improvement_areas) == 1:
+                    areas_text = improvement_areas[0]
+                else:
+                    areas_text = ", ".join(improvement_areas[:-1]) + f", and {improvement_areas[-1]}"
                 return (
                     f"{greeting}\n\n"
-                    f"During a brief review of {website_url or 'your website'}, we noticed "
-                    "a few items that may affect search visibility, mobile usability, or "
-                    f"visitor confidence:\n{observations}\n\n"
-                    "Our team can fix these website issues and help make the site clearer, "
-                    "more search-friendly, and more reliable for visitors. If you are "
-                    "interested, we would be happy to discuss the findings and the work required."
+                    f"During a brief review of {website_url or 'your website'}, we identified "
+                    f"some opportunities to improve {areas_text}.\n\n"
+                    "Our team can review and fix the relevant website areas without burdening "
+                    "you with technical details. If you are interested, we would be happy to "
+                    "discuss the potential impact and the work required."
                 )
             return (
                 f"{greeting}\n\n"
@@ -2437,6 +2454,42 @@ class Automation(GoogleResultsMixin, OutreachChannelsMixin):
             "software. If you are interested, we would be happy to discuss your "
             "requirements and recommend a practical solution."
         )
+
+    @staticmethod
+    def audit_improvement_areas(findings):
+        """Convert internal audit evidence into safe customer-facing categories."""
+        category_checks = (
+            ("mobile usability", ("viewport", "mobile")),
+            ("website security and visitor trust", ("http", "https", "insecure", "mixed resource")),
+            ("accessibility and user experience", ("alt text", "language", "accessibility")),
+            (
+                "SEO and search visibility",
+                ("page title", "title", "meta description", "h1", "canonical", "search result", "seo"),
+            ),
+        )
+        joined = " ".join(str(finding).lower() for finding in findings)
+        areas = [
+            label
+            for label, keywords in category_checks
+            if any(keyword in joined for keyword in keywords)
+        ]
+        return areas or ["overall website quality"]
+
+    @staticmethod
+    def audit_message_exposes_details(message):
+        """Reject AI drafts that leak technical audit details or exact item counts."""
+        text = str(message or "").lower()
+        technical_detail = re.search(
+            r"\b(?:h1|meta description|page title|canonical(?: url)?|alt text|"
+            r"viewport|html (?:tag|attribute)|mixed (?:content|resources?)|"
+            r"insecure http|http protocol|https protocol)\b",
+            text,
+        )
+        exact_count = re.search(
+            r"\b\d+\s+(?:of\s+\d+\s+)?(?:images?|headings?|forms?|resources?|items?)\b",
+            text,
+        )
+        return bool(technical_detail or exact_count)
 
     def contact_details_block(self):
         lines = []
@@ -2741,14 +2794,20 @@ class Automation(GoogleResultsMixin, OutreachChannelsMixin):
         return ""
 
     def attempt_preferred_outreach(self, result, website, business_key):
-        """Use WhatsApp first and email only when WhatsApp cannot be used."""
+        """Use every available channel, with WhatsApp sufficient on its own."""
         verified = result.get("_verified_whatsapp_phone", "")
         if not result.get("_whatsapp_attempted") and not verified:
             verified = self.preflight_whatsapp(result, business_key)
 
         email_recipients = self.email_recipients(result)
-        if not verified and not email_recipients:
+        has_website = bool(
+            website.get("url")
+            or website.get("has_website")
+            or website.get("website_redirect_url")
+        )
+        if not email_recipients:
             self.channel_outcome(result, "email", "no_email", "No email address found")
+        if not verified and not email_recipients and not has_website:
             return False
 
         if not result.get("proposal"):
@@ -2757,23 +2816,22 @@ class Automation(GoogleResultsMixin, OutreachChannelsMixin):
         if not result.get("proposal"):
             return False
 
+        sent_any = False
         if verified and not result.get("_whatsapp_attempted"):
             result["_whatsapp_attempted"] = True
             sent = self.send_whatsapp_message(result, business_key)
             if sent:
                 result["whatsapp_sent"] = True
-            status = result.get("channel_status", {}).get("whatsapp", {}).get("status")
-            if sent or status in {"uncertain", "review", "already_sent"}:
-                return sent
+                sent_any = True
 
-        # SMTP is an exclusive fallback: it is never attempted after a
-        # confirmed or possibly-completed WhatsApp send.
+        # Email is an additional channel, not a fallback. If an address was
+        # discovered, attempt it even when WhatsApp succeeded or needs review.
         if email_recipients:
             sent = self.send_email_message(result, business_key)
             if sent:
                 result["email_sent"] = True
-            return sent
-        return False
+                sent_any = True
+        return sent_any
 
 
     def channel_image_path(self, section):

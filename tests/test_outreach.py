@@ -216,8 +216,37 @@ class OutreachTests(unittest.TestCase):
         prompt=self.bot.ask_ai.call_args.args[0]
         self.assertIn('website checked: https://fixture.test',prompt.lower())
         self.assertIn('the homepage has no main h1 heading',prompt.lower())
-        self.assertIn('our team can fix the identified website issues',prompt.lower())
-        self.assertIn('do not provide the full technical solution',prompt.lower())
+        self.assertIn('for grounding only',prompt.lower())
+        self.assertIn('do not mention exact issues',prompt.lower())
+        self.assertIn('do not provide a technical solution',prompt.lower())
+
+    def test_ai_draft_that_exposes_audit_details_is_replaced_with_general_summary(self):
+        self.bot.ask_ai=MagicMock(return_value=(
+            'Your homepage has no H1 tag and 44 images are missing alt text.'
+        ))
+        message=self.bot.generate_website_proposal({
+            'name':'Has site',
+            'url':'https://fixture.test',
+            'audit_findings':[
+                'The homepage has no main H1 heading.',
+                '44 of 50 homepage images are missing descriptive alt text.',
+            ],
+        })
+        self.assertIn('seo and search visibility',message.lower())
+        self.assertIn('accessibility and user experience',message.lower())
+        self.assertNotIn('h1',message.lower())
+        self.assertNotIn('alt text',message.lower())
+        self.assertNotIn('44',message)
+
+    def test_ai_draft_with_general_audit_language_is_kept(self):
+        safe_message='We found opportunities to improve SEO and accessibility.'
+        self.bot.ask_ai=MagicMock(return_value=safe_message)
+        message=self.bot.generate_website_proposal({
+            'name':'Has site',
+            'url':'https://fixture.test',
+            'audit_findings':['The homepage has no main H1 heading.'],
+        })
+        self.assertEqual(message,safe_message)
 
     def test_software_company_gets_partnership_prompt_not_website_pitch(self):
         self.bot.ask_ai = MagicMock(return_value='Partnership message')
@@ -281,7 +310,7 @@ class OutreachTests(unittest.TestCase):
         self.assertFalse(result['proposal'])
         self.assertEqual(result['channel_status']['email']['status'], 'no_email')
 
-    def test_invalid_whatsapp_falls_back_to_email_found_on_website(self):
+    def test_invalid_whatsapp_uses_email_found_on_website(self):
         self.bot.preflight_whatsapp = MagicMock(return_value='')
         self.bot.open_website = MagicMock(return_value={'window_handle':'site','original_window':'google'})
         self.bot.find_emails = MagicMock(return_value=['hello@fixture.test'])
@@ -302,17 +331,42 @@ class OutreachTests(unittest.TestCase):
         self.bot.send_email_message.assert_called_once()
         self.assertTrue(result['email_sent'])
 
-    def test_website_without_working_whatsapp_or_email_skips_message_generation(self):
+    def test_website_without_working_whatsapp_or_email_prepares_contact_form_message(self):
         self.bot.preflight_whatsapp = MagicMock(return_value='')
         self.bot.open_website = MagicMock(return_value={'window_handle':'site','original_window':'google'})
         self.bot.find_emails = MagicMock(return_value=[])
         self.bot.find_phone_numbers = MagicMock(return_value=[])
         self.bot.find_whatsapp_numbers = MagicMock(return_value=[])
         self.bot.find_contact_page = MagicMock(return_value=None)
-        self.bot.generate_website_proposal = MagicMock(return_value='Should not be generated')
+        self.bot.generate_website_proposal = MagicMock(return_value='Contact form message')
+        self.bot.fill_contact_form = MagicMock(return_value=True)
         result = self.bot.process_website({'name':'No channel','url':'https://fixture.test'})
-        self.bot.generate_website_proposal.assert_not_called()
-        self.assertFalse(result['proposal'])
+        self.bot.generate_website_proposal.assert_called_once()
+        self.bot.fill_contact_form.assert_called_once()
+        self.assertEqual(result['proposal'], 'Contact form message')
+        self.assertTrue(result['form_prefilled'])
+
+    def test_successful_whatsapp_also_sends_email_when_found(self):
+        self.bot.preflight_whatsapp = MagicMock(return_value='971501112222')
+        self.bot.send_whatsapp_message = MagicMock(return_value=True)
+        self.bot.send_email_message = MagicMock(return_value=True)
+        self.bot.generate_website_proposal = MagicMock(return_value='Hello')
+        result = {
+            'emails':['hello@fixture.test'],
+            'phones':['0501112222'],
+            'proposal':'',
+            'channel_status':{},
+        }
+        sent = self.bot.attempt_preferred_outreach(
+            result,
+            {'name':'Both channels','url':'https://fixture.test'},
+            'key',
+        )
+        self.assertTrue(sent)
+        self.bot.send_whatsapp_message.assert_called_once()
+        self.bot.send_email_message.assert_called_once()
+        self.assertTrue(result['whatsapp_sent'])
+        self.assertTrue(result['email_sent'])
 
     def test_whatsapp_preflight_reuses_tab_and_opens_no_message_text(self):
         element = MagicMock()
@@ -362,8 +416,26 @@ class OutreachTests(unittest.TestCase):
         })
         self.bot.ask_ai.assert_not_called()
         self.assertIn('https://fixture.test',message.lower())
-        self.assertIn('no meta description',message.lower())
-        self.assertIn('our team can fix',message.lower())
+        self.assertIn('seo and search visibility',message.lower())
+        self.assertNotIn('meta description',message.lower())
+        self.assertNotIn('h1',message.lower())
+        self.assertIn('review and fix',message.lower())
+
+    def test_local_message_generalizes_multiple_findings_without_counts(self):
+        self.bot.config['use_browser_ai']=False
+        message=self.bot.generate_website_proposal({
+            'name':'General Trading',
+            'url':'https://fixture.test',
+            'audit_findings':[
+                'The homepage has no main H1 heading.',
+                '44 of 50 homepage images are missing descriptive alt text.',
+            ],
+        })
+        self.assertIn('seo and search visibility',message.lower())
+        self.assertIn('accessibility and user experience',message.lower())
+        self.assertNotIn('h1',message.lower())
+        self.assertNotIn('alt text',message.lower())
+        self.assertNotIn('44',message)
 
     def test_homepage_audit_reports_only_observable_signals(self):
         self.bot.driver.execute_script.return_value = {
@@ -412,7 +484,7 @@ class OutreachTests(unittest.TestCase):
         self.bot.fill_contact_form=MagicMock(side_effect=RuntimeError('Form broke'))
         result=self.bot.process_website({'name':'Salon','url':'https://fixture.test'})
         self.bot.send_whatsapp_message.assert_called_once()
-        self.bot.send_email_message.assert_not_called()
+        self.bot.send_email_message.assert_called_once()
         self.assertEqual(set(result['phones']),{'0503334444','0505556666'})
 
     def test_filled_form_still_runs_outreach(self):
@@ -420,7 +492,7 @@ class OutreachTests(unittest.TestCase):
         result=self.bot.process_website({'name':'Salon','url':'https://fixture.test'})
         self.assertTrue(result['form_prefilled'])
         self.bot.send_whatsapp_message.assert_called_once()
-        self.bot.send_email_message.assert_not_called()
+        self.bot.send_email_message.assert_called_once()
         self.assertEqual(outreach_stats(self.bot.db)[0]['forms'],1)
 
     def test_google_phone_is_used_before_failed_website(self):
