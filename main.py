@@ -93,6 +93,12 @@ IMPORTANT:
   such as website work, integrations, custom software, accounting, POS, CRM,
   inventory, e-commerce, booking, automation, maintenance, SEO, or marketing.
 - Do not write a generic list or imply that every service is suitable.
+- For an ordinary business, propose one dedicated software concept tailored to
+  its likely industry and briefly explain how it could streamline operations.
+  Mention only two or three relevant capabilities, without assuming that the
+  business currently lacks them or claiming guaranteed results.
+- End by asking whether they are interested in website improvements, new or
+  updated dedicated business software, or both.
 - If the target is itself a software, IT, web, advertising, or marketing
   provider, treat it as a potential partner and propose collaboration rather
   than selling website development or ordinary client services.
@@ -2298,7 +2304,11 @@ class Automation(GoogleResultsMixin, OutreachChannelsMixin):
             prompt += (
                 "\n\nThis business has no website listed. Clearly and politely propose "
                 "creating a new professional, modern website to upgrade their online "
-                "presence. Do not imply that they already have a website."
+                "presence. Also propose one dedicated software concept tailored to its "
+                "industry that could streamline day-to-day operations. Ask whether they "
+                "would like to discuss a new website, new or updated dedicated software, "
+                "or both. Do not "
+                "imply that they already have a website or currently lack suitable software."
             )
         else:
             prompt += f"\n\nWEBSITE REVIEW:\nWebsite checked: {website_url or 'Website URL listed on Google'}"
@@ -2318,14 +2328,22 @@ class Automation(GoogleResultsMixin, OutreachChannelsMixin):
                     "fix the relevant website areas and invite them to discuss the work. "
                     "Do not invent additional issue categories. "
                     "Do not claim the site is hacked, vulnerable, unsafe, penalized, or "
-                    "non-responsive unless the confirmed observations explicitly prove it."
+                    "non-responsive unless the confirmed observations explicitly prove it. "
+                    "After the website summary, propose one dedicated software concept "
+                    "specific to this business type that could streamline its operations. "
+                    "Mention only two or three relevant capabilities. End by asking whether "
+                    "they would be interested in website improvements, new or updated "
+                    "dedicated software, or both."
                 )
             else:
                 prompt += (
                     "\nNo specific issue was safely confirmed by the automated homepage "
                     "check. Do not invent an SEO, responsive-design, performance, or security "
                     "problem. Offer a deeper review and explain that we can fix any confirmed "
-                    "website issues, keeping the message brief."
+                    "website issues. Then propose one dedicated software concept specific to "
+                    "this business type that could streamline its operations, and ask whether "
+                    "they are interested in website improvements, new or updated dedicated "
+                    "software, or both."
                 )
 
         if partnership_outreach:
@@ -2337,8 +2355,11 @@ class Automation(GoogleResultsMixin, OutreachChannelsMixin):
         elif has_website:
             prompt += (
                 "\n\nKeep the message focused on the broad website improvement areas "
-                "supported by the review. Do not expose the underlying observations, "
-                "replace them with a generic list of our services, or include a technical tutorial."
+                "supported by the review and one genuinely relevant dedicated-software idea. "
+                "Do not expose the underlying observations, replace the tailored idea with a "
+                "generic service list, or include a technical tutorial. Arrange the message "
+                "professionally: website review, tailored software opportunity, then a concise "
+                "question about website improvements, new or updated software, or both."
             )
         else:
             prompt += (
@@ -2415,6 +2436,7 @@ class Automation(GoogleResultsMixin, OutreachChannelsMixin):
         )
         if has_website:
             website_url = str(website.get("url", "") or "").strip()
+            software_idea = self.business_software_suggestion(website)
             findings = [
                 str(finding).strip()
                 for finding in website.get("audit_findings", [])
@@ -2430,29 +2452,75 @@ class Automation(GoogleResultsMixin, OutreachChannelsMixin):
                     f"{greeting}\n\n"
                     f"During a brief review of {website_url or 'your website'}, we identified "
                     f"some opportunities to improve {areas_text}.\n\n"
-                    "Our team can review and fix the relevant website areas without burdening "
-                    "you with technical details. If you are interested, we would be happy to "
-                    "discuss the potential impact and the work required."
+                    "Our team can review and update the relevant website areas without burdening "
+                    "you with technical details.\n\n"
+                    f"We can also develop {software_idea} to help streamline your day-to-day "
+                    "operations. Would you be interested in discussing website improvements, "
+                    "new or updated dedicated software, or both?"
                 )
             return (
                 f"{greeting}\n\n"
                 f"We took a brief look at {website_url or 'your website'}. Our automated "
                 "homepage check did not confirm a specific issue that would be fair to "
                 "claim without a deeper review. We can perform a closer website review "
-                "and fix any confirmed SEO, mobile-usability, performance, or security-"
-                "baseline issues. If you are interested, we would be happy to discuss it."
+                "and update any confirmed SEO, mobile-usability, performance, or security-"
+                "baseline issues.\n\n"
+                f"We can also develop {software_idea} to help streamline your day-to-day "
+                "operations. Would you be interested in discussing website improvements, "
+                "new or updated dedicated software, or both?"
             )
 
+        software_idea = self.business_software_suggestion(website)
         return (
             f"{greeting}\n\n"
             "Your Google Business Profile does not currently show a website. We can "
             "create a professional, mobile-friendly website to upgrade your online presence, "
             "with clear service information, contact details, location, and online "
             "booking or enquiry features where useful.\n\n"
-            "We can also help with domain and hosting, business email, local SEO, "
-            "digital marketing, ongoing maintenance, POS, CRM, and related business "
-            "software. If you are interested, we would be happy to discuss your "
-            "requirements and recommend a practical solution."
+            f"We can also develop {software_idea} to help streamline your day-to-day "
+            "operations. Would you be interested in discussing a new website, new or "
+            "updated dedicated software, or both?"
+        )
+
+    @staticmethod
+    def business_software_suggestion(website):
+        """Return one concise software concept tailored to the likely business type."""
+        context = " ".join(
+            str(website.get(key, "") or "")
+            for key in ("name", "profile_text", "business_context", "search_query")
+        ).lower()
+        suggestions = (
+            (("travel", "tour", "holiday", "visa"),
+             "a dedicated travel-operations platform for enquiries, bookings, itineraries, and customer follow-up"),
+            (("hotel", "resort", "hospitality"),
+             "a tailored hospitality platform for reservations, guest requests, and operational reporting"),
+            (("restaurant", "cafe", "cafeteria", "catering"),
+             "a tailored restaurant platform for orders, reservations, inventory, and customer management"),
+            (("salon", "spa", "beauty", "barber"),
+             "a dedicated salon-management platform for appointments, staff schedules, customer records, and reminders"),
+            (("clinic", "medical", "dental", "health"),
+             "a tailored clinic-administration platform for appointments, customer communication, and operational reporting"),
+            (("real estate", "property", "properties", "broker"),
+             "a dedicated property-management and CRM platform for listings, enquiries, viewings, and lead follow-up"),
+            (("logistics", "cargo", "courier", "transport", "delivery"),
+             "a tailored logistics platform for bookings, shipment tracking, customer updates, and operational reporting"),
+            (("construction", "contracting", "engineering"),
+             "a dedicated project-operations platform for quotations, job progress, documents, and management reporting"),
+            (("school", "training", "education", "academy", "institute"),
+             "a tailored education platform for enrolment, schedules, student communication, and payment tracking"),
+            (("consult", "business setup", "advisory", "accounting"),
+             "a dedicated client-operations platform for enquiries, cases, documents, tasks, and follow-up"),
+            (("trading", "retail", "shop", "store", "wholesale"),
+             "a tailored business-management platform for sales, inventory, purchasing, and customer follow-up"),
+            (("maintenance", "cleaning", "repair", "technical service"),
+             "a dedicated service-management platform for enquiries, quotations, job scheduling, and customer follow-up"),
+        )
+        for keywords, suggestion in suggestions:
+            if any(keyword in context for keyword in keywords):
+                return suggestion
+        return (
+            "a dedicated business-operations platform for customer management, "
+            "workflow tracking, and management reporting"
         )
 
     @staticmethod

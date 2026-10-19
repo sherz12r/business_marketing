@@ -248,6 +248,36 @@ class OutreachTests(unittest.TestCase):
         })
         self.assertEqual(message,safe_message)
 
+    def test_existing_travel_business_prompt_proposes_tailored_software_and_both_options(self):
+        self.bot.ask_ai=MagicMock(return_value='Hello')
+        self.bot.generate_website_proposal({
+            'name':'Desert Sky Travel',
+            'profile_text':'Travel agency and tour operator',
+            'url':'https://fixture.test',
+            'audit_findings':['The homepage has no meta description for search-result summaries.'],
+        })
+        prompt=self.bot.ask_ai.call_args.args[0].lower()
+        self.assertIn('dedicated software concept',prompt)
+        self.assertIn('streamline its operations',prompt)
+        self.assertIn('website improvements, new or updated dedicated software, or both',prompt)
+        self.assertIn('do not mention exact issues',prompt)
+
+    def test_local_travel_message_combines_general_website_review_and_software(self):
+        self.bot.config['use_browser_ai']=False
+        message=self.bot.generate_website_proposal({
+            'name':'Desert Sky Travel',
+            'profile_text':'Travel agency and tour operator',
+            'url':'https://fixture.test',
+            'audit_findings':['The homepage has no main H1 heading.'],
+        })
+        lower=message.lower()
+        self.assertIn('seo and search visibility',lower)
+        self.assertIn('travel-operations platform',lower)
+        self.assertIn('bookings',lower)
+        self.assertIn('itineraries',lower)
+        self.assertIn('website improvements, new or updated dedicated software, or both',lower)
+        self.assertNotIn('h1',lower)
+
     def test_software_company_gets_partnership_prompt_not_website_pitch(self):
         self.bot.ask_ai = MagicMock(return_value='Partnership message')
         message = self.bot.generate_website_proposal({
@@ -419,7 +449,7 @@ class OutreachTests(unittest.TestCase):
         self.assertIn('seo and search visibility',message.lower())
         self.assertNotIn('meta description',message.lower())
         self.assertNotIn('h1',message.lower())
-        self.assertIn('review and fix',message.lower())
+        self.assertIn('review and update',message.lower())
 
     def test_local_message_generalizes_multiple_findings_without_counts(self):
         self.bot.config['use_browser_ai']=False

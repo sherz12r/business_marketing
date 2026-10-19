@@ -90,6 +90,12 @@ IMPORTANT:
   such as website work, integrations, custom software, accounting, POS, CRM,
   inventory, e-commerce, booking, automation, maintenance, SEO, or marketing.
 - Do not write a generic list or imply that every service is suitable.
+- For an ordinary business, propose one dedicated software concept tailored to
+  its likely industry and briefly explain how it could streamline operations.
+  Mention only two or three relevant capabilities, without assuming that the
+  business currently lacks them or claiming guaranteed results.
+- End by asking whether they are interested in website improvements, new or
+  updated dedicated business software, or both.
 - If the target is itself a software, IT, web, advertising, or marketing
   provider, treat it as a potential partner and propose collaboration rather
   than selling website development or ordinary client services.
