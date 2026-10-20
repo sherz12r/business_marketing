@@ -28,7 +28,8 @@ class OutreachTests(unittest.TestCase):
                            'email': {'enabled': True, 'auto_send': True, 'smtp_host': 'smtp.test',
                                      'from_email': 'sender@example.test', 'smtp_username': '',
                                      'smtp_password': '', 'include_contact_details': False},
-                           'whatsapp': {'enabled': True, 'auto_send': True, 'include_contact_details': False},
+                           'whatsapp': {'enabled': True, 'auto_send': True, 'include_contact_details': False,
+                                        'invalid_number_pause_seconds': 0},
                            'website_forms': {'include_contact_details': True}}
         self.bot.data_dir = work
         self.bot.db = sqlite3.connect(self.bot.data_dir / 'outreach.sqlite3')
@@ -422,7 +423,7 @@ class OutreachTests(unittest.TestCase):
         )
         self.assertTrue(self.bot.whatsapp_unavailable_reason())
 
-    def test_invalid_number_preflight_dismisses_dialog_immediately(self):
+    def test_invalid_number_preflight_dismisses_immediately_when_pause_is_zero(self):
         self.bot.whatsapp_window = 'wa'
         self.bot.driver.current_window_handle = 'google'
         self.bot.driver.window_handles = ['google', 'wa']
@@ -435,6 +436,13 @@ class OutreachTests(unittest.TestCase):
 
         self.assertEqual(state, 'not_on_whatsapp')
         self.bot.dismiss_whatsapp_unavailable_dialog.assert_called_once_with(self.bot.driver)
+
+    def test_invalid_number_pause_keeps_notice_visible_for_configured_time(self):
+        self.bot.config['whatsapp']['invalid_number_pause_seconds'] = 7
+        with patch('main.sleep') as pause:
+            self.bot.pause_before_invalid_whatsapp_continue()
+        pause.assert_called_once_with(7)
+        self.bot._log.assert_called_once()
 
     def test_local_message_mode_does_not_open_browser_ai(self):
         self.bot.config['use_browser_ai']=False
@@ -677,6 +685,71 @@ class OutreachTests(unittest.TestCase):
         self.assertGreaterEqual(response.json['campaign']['total'],150)
         self.assertEqual(len(response.json['areas']),response.json['campaign']['total'])
         self.assertIn('no-store',response.headers['Cache-Control'])
+
+    def test_dashboard_returns_saved_message_and_retry_starts_one_lead_job(self):
+        _site, key = self.seed('retry-ready')
+        self.bot.db.execute(
+            "UPDATE outreach SET emails=?, proposal=?, channel_status=? WHERE business_key=?",
+            (json.dumps(['hello@fixture.test']), 'Keep this exact message',
+             json.dumps({'email': {'status': 'failed', 'reason': 'Temporary SMTP error'}}), key),
+        )
+        self.bot.db.commit()
+        state = {'pid': 321, 'mode': 'retry-email', 'status': 'running'}
+        with patch('web_app.data_dir', return_value=self.bot.data_dir), \
+             patch('web_app.job_status', return_value={}), \
+             patch('web_app.start_process', return_value=state) as start, \
+             patch('web_app.authenticated', return_value=True):
+            client = web_app.app.test_client()
+            dashboard = client.get('/api/dashboard')
+            retry = client.post(f'/api/leads/{key}/retry', json={'channel': 'email'})
+        lead = next(item for item in dashboard.json['leads'] if item['key'] == key)
+        self.assertEqual(lead['proposal'], 'Keep this exact message')
+        self.assertEqual(lead['channel_status']['email']['status'], 'failed')
+        self.assertEqual(retry.status_code, 202)
+        start.assert_called_once_with('retry-email', ['--retry-email', key])
+
+    def test_retry_endpoint_rejects_confirmed_send(self):
+        _site, key = self.seed('already-sent')
+        self.bot.db.execute(
+            "UPDATE outreach SET emails=?, proposal=? WHERE business_key=?",
+            (json.dumps(['hello@fixture.test']), 'Saved message', key),
+        )
+        record_event(self.bot.db, 'email_sent', key, recipient='hello@fixture.test')
+        with patch('web_app.data_dir', return_value=self.bot.data_dir), \
+             patch('web_app.job_status', return_value={}), \
+             patch('web_app.start_process') as start, \
+             patch('web_app.authenticated', return_value=True):
+            response = web_app.app.test_client().post(
+                f'/api/leads/{key}/retry', json={'channel': 'email'}
+            )
+        self.assertEqual(response.status_code, 409)
+        start.assert_not_called()
+
+    def test_single_lead_retry_reuses_saved_proposal_and_preserves_other_channel(self):
+        _site, key = self.seed('saved-retry')
+        self.bot.db.execute(
+            "UPDATE outreach SET emails=?, proposal=?, channel_status=? WHERE business_key=?",
+            (json.dumps(['hello@fixture.test']), 'Exact saved proposal',
+             json.dumps({'whatsapp': {'status': 'failed', 'reason': 'No confirmation'}}), key),
+        )
+        self.bot.db.commit()
+        captured = {}
+
+        def send(result, _key):
+            captured['proposal'] = result['proposal']
+            result['email_sent'] = True
+            return self.bot.channel_outcome(result, 'email', 'sent') or True
+
+        self.bot.send_email_message = MagicMock(side_effect=send)
+        self.bot.process_retry_channel('email', key)
+        saved = self.bot.db.execute(
+            'SELECT proposal,channel_status FROM outreach WHERE business_key=?', (key,)
+        ).fetchone()
+        statuses = json.loads(saved['channel_status'])
+        self.assertEqual(captured['proposal'], 'Exact saved proposal')
+        self.assertEqual(saved['proposal'], 'Exact saved proposal')
+        self.assertEqual(statuses['email']['status'], 'sent')
+        self.assertEqual(statuses['whatsapp']['status'], 'failed')
 
     def test_pending_email_works_after_schema_migration(self):
         self.seed('pending')

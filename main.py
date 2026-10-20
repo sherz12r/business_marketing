@@ -175,7 +175,7 @@ class Automation(GoogleResultsMixin, OutreachChannelsMixin):
         except OSError:
             pass
 
-    def __init__(self, mode="full"):
+    def __init__(self, mode="full", retry_business_key=""):
         self.config = self.read_json(str(Path(get_app_dir()) / 'config.json'))
         self.mode = mode
         
@@ -211,10 +211,15 @@ class Automation(GoogleResultsMixin, OutreachChannelsMixin):
         self.whatsapp_window = None
         self.current_area = {}
 
-        if self.mode == "pending-email":
+        if self.mode in {"pending-email", "retry-email"}:
             try:
-                self.process_pending_channel("email")
-                self.finish_run("completed", "Pending email queue checked")
+                if self.mode == "retry-email":
+                    self.process_retry_channel("email", retry_business_key)
+                    reason = "Email retry checked"
+                else:
+                    self.process_pending_channel("email")
+                    reason = "Pending email queue checked"
+                self.finish_run("completed", reason)
             except Exception as exc:
                 self.finish_run("failed", str(exc))
                 raise
@@ -247,10 +252,15 @@ class Automation(GoogleResultsMixin, OutreachChannelsMixin):
         self.driver.set_page_load_timeout(45)
         self._log("Browser ready.")
         self.iframe_found = False
-        if self.mode == "pending-whatsapp":
+        if self.mode in {"pending-whatsapp", "retry-whatsapp"}:
             try:
-                self.process_pending_channel("whatsapp")
-                self.finish_run("completed", "Pending WhatsApp queue checked")
+                if self.mode == "retry-whatsapp":
+                    self.process_retry_channel("whatsapp", retry_business_key)
+                    reason = "WhatsApp retry checked"
+                else:
+                    self.process_pending_channel("whatsapp")
+                    reason = "Pending WhatsApp queue checked"
+                self.finish_run("completed", reason)
             except Exception as exc:
                 self.finish_run("failed", str(exc))
                 raise
@@ -295,21 +305,7 @@ class Automation(GoogleResultsMixin, OutreachChannelsMixin):
 
         sent_count = 0
         for index, row in enumerate(rows, start=1):
-            result = {
-                "name": row[1] or "",
-                "website": row[2] or "",
-                "contact_page": row[3] or "",
-                "emails": self.parse_stored_list(row[4]),
-                "phones": self.parse_stored_list(row[5]),
-                "proposal": row[6] or "",
-                "form_prefilled": bool(row[7]),
-                "status": row[8] or "draft_ready",
-                "email_sent": bool(row["email_sent"]),
-                "whatsapp_sent": bool(row["whatsapp_sent"]),
-                "whatsapp_phones": self.parse_stored_list(row["whatsapp_phones"]),
-                "area_key": row["area_key"] or "",
-                "run_id": self.run_id,
-            }
+            result = self.stored_result(row)
             business_key = row[0]
             self.register_candidate(business_key, {'name': result['name'], 'url': result['website']})
             self._log(
@@ -330,6 +326,69 @@ class Automation(GoogleResultsMixin, OutreachChannelsMixin):
             f"Pending {channel} run completed: {sent_count} sent, "
             f"{len(rows) - sent_count} skipped or failed."
         )
+
+    def process_retry_channel(self, channel, business_key):
+        """Retry one saved draft without regenerating its proposal."""
+        if not business_key:
+            raise ValueError("A business key is required for a retry")
+        row = self.db.execute(
+            """SELECT o.*,
+                      (o.status IN ('email_sent', 'fallback_sent')
+                       OR EXISTS(SELECT 1 FROM outreach_events e
+                             WHERE e.business_key=o.business_key AND e.event_type=?)) email_sent,
+                      (o.status IN ('whatsapp_sent', 'fallback_sent')
+                       OR EXISTS(SELECT 1 FROM outreach_events e
+                             WHERE e.business_key=o.business_key AND e.event_type=?)) whatsapp_sent
+                 FROM outreach o WHERE o.business_key=?""",
+            (EVENT_EMAIL_SENT, EVENT_WHATSAPP_SENT, business_key),
+        ).fetchone()
+        if not row:
+            raise ValueError("Lead not found")
+        result = self.stored_result(row)
+        if not result["proposal"].strip():
+            raise ValueError("Lead has no saved generated message")
+        result["_manual_retry"] = True
+        section = self.config.setdefault(channel, {})
+        if isinstance(section, dict):
+            section["auto_send"] = True
+        self.register_candidate(business_key, {"name": result["name"], "url": result["website"]})
+        self._log(f"Retrying saved {channel} message for {result['name'] or result['website'] or business_key}.")
+        try:
+            sent = getattr(self, f"send_{channel}_message")(result, business_key)
+        except Exception as exc:
+            sent = self.channel_outcome(result, channel, "failed", str(exc))
+        self.db.execute(
+            "UPDATE run_businesses SET processed=1,status=? WHERE run_id=? AND business_key=?",
+            ("sent" if sent else "error", self.run_id, business_key),
+        )
+        self.update_result_status(result)
+        self.save_outreach(business_key, result)
+        self._log(f"Saved {channel} retry result: {'sent' if sent else 'not sent'}.")
+        return sent
+
+    def stored_result(self, row):
+        """Rehydrate a stored lead, including both persisted channel outcomes."""
+        try:
+            channel_status = json.loads(row["channel_status"] or "{}")
+        except (TypeError, ValueError):
+            channel_status = {}
+        return {
+            "name": row["business_name"] or "",
+            "website": row["website"] or "",
+            "contact_page": row["contact_page"] or "",
+            "emails": self.parse_stored_list(row["emails"]),
+            "phones": self.parse_stored_list(row["phones"]),
+            "proposal": row["proposal"] or "",
+            "form_prefilled": bool(row["form_prefilled"]),
+            "status": row["status"] or "draft_ready",
+            "email_sent": bool(row["email_sent"]),
+            "whatsapp_sent": bool(row["whatsapp_sent"]),
+            "channel_status": channel_status if isinstance(channel_status, dict) else {},
+            "whatsapp_phones": self.parse_stored_list(row["whatsapp_phones"]),
+            "area_key": row["area_key"] or "",
+            "last_error": row["last_error"] or "",
+            "run_id": self.run_id,
+        }
 
     @staticmethod
     def parse_stored_list(value):
@@ -2769,6 +2828,7 @@ class Automation(GoogleResultsMixin, OutreachChannelsMixin):
             def chat_state(driver):
                 unavailable = self.whatsapp_unavailable_reason(driver)
                 if unavailable:
+                    self.pause_before_invalid_whatsapp_continue()
                     self.dismiss_whatsapp_unavailable_dialog(driver)
                     return ("not_on_whatsapp", unavailable)
                 selectors = (
@@ -2792,6 +2852,7 @@ class Automation(GoogleResultsMixin, OutreachChannelsMixin):
         except TimeoutException:
             unavailable = self.whatsapp_unavailable_reason()
             if unavailable:
+                self.pause_before_invalid_whatsapp_continue()
                 self.dismiss_whatsapp_unavailable_dialog()
                 self.whatsapp_login_wait_used = True
                 return "not_on_whatsapp", unavailable
@@ -3045,6 +3106,7 @@ class Automation(GoogleResultsMixin, OutreachChannelsMixin):
                 self.whatsapp_login_wait_used = True
                 unavailable_reason = self.whatsapp_unavailable_reason()
                 if unavailable_reason:
+                    self.pause_before_invalid_whatsapp_continue()
                     self.dismiss_whatsapp_unavailable_dialog()
                     return self.channel_outcome(
                         result,
@@ -3209,6 +3271,21 @@ class Automation(GoogleResultsMixin, OutreachChannelsMixin):
         if any(marker in text for marker in markers) or dynamic_number_error:
             return "Number is invalid or not registered on WhatsApp; skipped"
         return ""
+
+    def pause_before_invalid_whatsapp_continue(self):
+        """Leave WhatsApp's invalid-number notice visible for review."""
+        try:
+            seconds = max(0, int(self.get_section_setting(
+                "whatsapp", "invalid_number_pause_seconds", default=10
+            )))
+        except (TypeError, ValueError):
+            seconds = 10
+        if seconds:
+            self._log(
+                f"Number is not on WhatsApp; keeping the notice visible for "
+                f"{seconds} second(s) before continuing."
+            )
+            sleep(seconds)
 
     def dismiss_whatsapp_unavailable_dialog(self, driver=None):
         """Close WhatsApp's invalid-number modal so the reused tab is ready."""
@@ -4519,11 +4596,18 @@ class Automation(GoogleResultsMixin, OutreachChannelsMixin):
         
 if __name__ == "__main__":
     mode = "full"
+    retry_business_key = ""
     if "--pending-whatsapp" in sys.argv:
         mode = "pending-whatsapp"
     elif "--pending-email" in sys.argv:
         mode = "pending-email"
+    elif "--retry-whatsapp" in sys.argv:
+        mode = "retry-whatsapp"
+        retry_business_key = sys.argv[sys.argv.index("--retry-whatsapp") + 1]
+    elif "--retry-email" in sys.argv:
+        mode = "retry-email"
+        retry_business_key = sys.argv[sys.argv.index("--retry-email") + 1]
     print(f"[Marketing Bot] Launching {mode}...", flush=True)
-    automation = Automation(mode=mode)
+    automation = Automation(mode=mode, retry_business_key=retry_business_key)
     print("[Marketing Bot] Session ended.", flush=True)
 

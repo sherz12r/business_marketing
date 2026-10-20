@@ -46,6 +46,7 @@
         "open_for_review": true,
         "keep_tabs_open": false,
         "send_timeout_seconds": 10,
+        "invalid_number_pause_seconds": 10,
         "default_country_code": "971",
         "ignore_phone_prefixes": [
             "9712",

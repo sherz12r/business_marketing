@@ -108,7 +108,7 @@ class OutreachChannelsMixin:
         if self.recent_channel_events(business_key, EVENT_WHATSAPP_SENT):
             result['whatsapp_sent'] = True
             return self.channel_outcome(result, 'whatsapp', 'already_sent', 'Within configured contact cooldown')
-        if self.recent_channel_events(business_key, 'whatsapp_uncertain'):
+        if self.recent_channel_events(business_key, 'whatsapp_uncertain') and not result.get('_manual_retry'):
             return self.channel_outcome(result, 'whatsapp', 'uncertain', 'Previous click was not confirmed; review WhatsApp before retrying')
         numbers, usable, candidates = self.whatsapp_candidates(result)
         verified = result.get('_verified_whatsapp_phone', '')

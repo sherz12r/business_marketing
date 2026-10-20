@@ -7,7 +7,7 @@
   <title>Marketing Bot</title>
   <link rel="stylesheet" href="{{ url_for('static', filename='dashboard.css') }}">
 </head>
-<body data-dashboard-url="{{ url_for('dashboard_data') }}" data-start-url="{{ url_for('start_job') }}" data-stop-url="{{ url_for('stop_job') }}" data-log-url="{{ url_for('job_log') }}" data-settings-url="{{ url_for('get_settings') }}">
+<body data-dashboard-url="{{ url_for('dashboard_data') }}" data-start-url="{{ url_for('start_job') }}" data-stop-url="{{ url_for('stop_job') }}" data-log-url="{{ url_for('job_log') }}" data-settings-url="{{ url_for('get_settings') }}" data-retry-url="{{ url_for('retry_lead', business_key='__KEY__') }}">
   <header class="topbar">
     <div><span class="eyebrow">OUTREACH CONTROL</span><h1>Marketing Bot</h1></div>
     <div class="status"><i id="statusDot"></i><span id="statusText">Ready</span></div>
@@ -70,6 +70,10 @@
       <div id="settingsFields" class="settings-fields"></div>
       <div class="dialog-actions"><span id="settingsHint">Changes are saved to config.json.</span><button type="button" id="reloadSettings">Reload</button><button type="submit" class="primary">Save Settings</button></div>
     </form>
+  </dialog>
+  <dialog id="leadDialog" class="lead-dialog">
+    <div class="dialog-header"><div><p class="eyebrow">LEAD DETAILS</p><h3 id="leadDialogTitle">Lead</h3></div><button type="button" id="closeLead" class="small" aria-label="Close lead details">Close</button></div>
+    <div id="leadDetails" class="lead-details"></div>
   </dialog>
   <div id="toast" role="status" aria-live="polite"></div>
   <script src="{{ url_for('static', filename='dashboard.js') }}" defer></script>

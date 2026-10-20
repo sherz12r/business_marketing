@@ -178,8 +178,11 @@ def dashboard_data():
             "key": row["business_key"],
             "name": row["business_name"] or "Unnamed business",
             "website": row["website"] or "",
+            "contact_page": row["contact_page"] or "",
             "emails": parse_list(row["emails"]),
             "phones": parse_list(row["phones"]),
+            "whatsapp_phones": parse_list(row["whatsapp_phones"]),
+            "proposal": row["proposal"] or "",
             "status": row["status"] or "draft_ready",
             "channel_status": json.loads(row["channel_status"] or "{}"),
             "form_prefilled": bool(row["form_prefilled"]),
@@ -191,6 +194,8 @@ def dashboard_data():
             "area": row["area_name"] or "",
             "email_sent": bool(row["email_sent_at"]) or row["status"] in {"email_sent", "fallback_sent"},
             "whatsapp_sent": bool(row["whatsapp_sent_at"]) or row["status"] in {"whatsapp_sent", "fallback_sent"},
+            "email_sent_at": row["email_sent_at"] or "",
+            "whatsapp_sent_at": row["whatsapp_sent_at"] or "",
         })
     stats = {**totals, "leads": totals['businesses']}
     return jsonify({"stats": stats, "run": run, "campaign": campaign, "areas": areas,
@@ -225,6 +230,34 @@ def parse_list(value):
         return [part.strip() for part in str(value or "").split(";") if part.strip()]
 
 
+def start_process(mode, arguments):
+    """Start one background automation process and expose it to the dashboard."""
+    RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+    log_handle = LOG_PATH.open("w", encoding="utf-8", buffering=1)
+    command = [sys.executable, "-u", str(APP_DIR / "main.py"), *arguments]
+    options = {
+        "cwd": str(APP_DIR),
+        "stdout": log_handle,
+        "stderr": subprocess.STDOUT,
+        "stdin": subprocess.DEVNULL,
+        "env": {**os.environ},
+    }
+    if os.name != "nt":
+        options["start_new_session"] = True
+    try:
+        process = subprocess.Popen(command, **options)
+    finally:
+        log_handle.close()
+    state = {
+        "pid": process.pid,
+        "mode": mode,
+        "status": "running",
+        "started_at": datetime.now().isoformat(timespec="seconds"),
+    }
+    write_state(state)
+    return state
+
+
 @app.post("/api/jobs/start")
 @require_auth
 def start_job():
@@ -241,28 +274,58 @@ def start_job():
     if mode not in arguments:
         return jsonify({"error": "Unknown automation mode."}), 400
 
-    RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
-    log_handle = LOG_PATH.open("w", encoding="utf-8", buffering=1)
-    command = [sys.executable, "-u", str(APP_DIR / "main.py"), *arguments[mode]]
-    options = {
-        "cwd": str(APP_DIR),
-        "stdout": log_handle,
-        "stderr": subprocess.STDOUT,
-        "stdin": subprocess.DEVNULL,
-        # Browser visibility follows the headless value in config.json.
-        "env": {**os.environ},
-    }
-    if os.name != "nt":
-        options["start_new_session"] = True
-    process = subprocess.Popen(command, **options)
-    log_handle.close()
-    state = {
-        "pid": process.pid,
-        "mode": mode,
-        "status": "running",
-        "started_at": datetime.now().isoformat(timespec="seconds"),
-    }
-    write_state(state)
+    state = start_process(mode, arguments[mode])
+    return jsonify({**state, "running": True}), 202
+
+
+@app.post("/api/leads/<path:business_key>/retry")
+@require_auth
+def retry_lead(business_key):
+    current = job_status()
+    if current.get("running"):
+        return jsonify({"error": "An automation job is already running."}), 409
+
+    channel = str((request.get_json(silent=True) or {}).get("channel", "")).lower()
+    if channel not in {"email", "whatsapp"}:
+        return jsonify({"error": "Choose email or WhatsApp."}), 400
+
+    with closing(database()) as connection:
+        row = connection.execute(
+            "SELECT proposal, emails, phones, whatsapp_phones, status, channel_status "
+            "FROM outreach WHERE business_key=?",
+            (business_key,),
+        ).fetchone()
+        if not row:
+            return jsonify({"error": "Lead not found."}), 404
+        if not str(row["proposal"] or "").strip():
+            return jsonify({"error": "This lead has no saved generated message to resend."}), 409
+
+        contacts = parse_list(row["emails"] if channel == "email" else row["whatsapp_phones"])
+        if channel == "whatsapp" and not contacts:
+            contacts = parse_list(row["phones"])
+        if not contacts:
+            return jsonify({"error": f"This lead has no {channel} contact to retry."}), 409
+
+        event_type = EVENT_EMAIL_SENT if channel == "email" else EVENT_WHATSAPP_SENT
+        sent = connection.execute(
+            "SELECT 1 FROM outreach_events WHERE business_key=? AND event_type=? LIMIT 1",
+            (business_key, event_type),
+        ).fetchone()
+        try:
+            channel_status = json.loads(row["channel_status"] or "{}")
+        except (TypeError, ValueError):
+            channel_status = {}
+        outcome = str(channel_status.get(channel, {}).get("status", ""))
+        # Email retries remain safe after partial/failed attempts because the
+        # sender filters out recipients previously accepted by SMTP.
+        email_has_retryable_outcome = channel == "email" and outcome not in {"", "sent", "already_sent"}
+        if sent and not email_has_retryable_outcome:
+            return jsonify({"error": f"{channel.title()} was already sent successfully."}), 409
+        if row["status"] in {f"{channel}_sent", "fallback_sent"} and not email_has_retryable_outcome:
+            return jsonify({"error": f"{channel.title()} was already sent successfully."}), 409
+
+    mode = f"retry-{channel}"
+    state = start_process(mode, [f"--{mode}", business_key])
     return jsonify({**state, "running": True}), 202
 
 
