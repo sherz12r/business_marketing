@@ -15,6 +15,7 @@ from functools import wraps
 from pathlib import Path
 
 from flask import Flask, Response, jsonify, render_template, request
+from dotenv import load_dotenv
 
 from app_paths import get_app_dir
 from campaign import campaign_stats, load_location_catalog, seed_target_areas
@@ -29,6 +30,7 @@ from progress_tracker import (
 )
 
 APP_DIR = Path(get_app_dir())
+load_dotenv(APP_DIR / ".env")
 CONFIG_PATH = APP_DIR / "config.json"
 RUNTIME_DIR = APP_DIR / "data" / "runtime"
 STATE_PATH = RUNTIME_DIR / "web_job.json"
