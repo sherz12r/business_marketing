@@ -1480,17 +1480,31 @@ class Automation(GoogleResultsMixin, OutreachChannelsMixin):
                         )
 
                         result["form_prefilled"] = True
+                        submission_status = getattr(
+                            self, "last_form_submission_status", "review"
+                        )
                         try:
                             record_event(
                                 self.db,
                                 EVENT_FORM_PREFILLED,
                                 business_key,
                                 result,
-                                details="Contact form prefilled for review",
+                                details=(
+                                    "Contact form submission confirmed"
+                                    if submission_status == "submitted"
+                                    else "Contact form submit clicked; confirmation unavailable"
+                                    if submission_status == "clicked_unconfirmed"
+                                    else "Contact form submission blocked by validation"
+                                    if submission_status == "validation_failed"
+                                    else "Contact form filled; submit control unavailable"
+                                    if submission_status == "not_submitted"
+                                    else "Contact form prefilled for review"
+                                ),
                             )
                         except Exception as exc:
                             self._log(f"Progress event error: {exc}")
-                        self._log("Review mode: form prefilled but not submitted.")
+                        if submission_status == "review":
+                            self._log("Review mode: form prefilled but not submitted.")
             except Exception as e:
                 self._log(
                     f"Outreach preparation error: {e}"
@@ -4298,6 +4312,152 @@ class Automation(GoogleResultsMixin, OutreachChannelsMixin):
             return False
 
 
+    def submit_contact_form(self, form):
+        """Submit a filled contact form once and wait briefly for an outcome."""
+        before_url = str(getattr(self.driver, "current_url", "") or "")
+        submit_button = None
+        selectors = (
+            "button[type='submit']",
+            "input[type='submit']",
+            "button[name*='submit' i]",
+            "button[id*='submit' i]",
+            "button[class*='submit' i]",
+            "button[name*='send' i]",
+            "button[id*='send' i]",
+            "button[aria-label*='send' i]",
+            "button[title*='send' i]",
+        )
+
+        for selector in selectors:
+            try:
+                for candidate in form.find_elements(By.CSS_SELECTOR, selector):
+                    if candidate.is_displayed() and candidate.is_enabled():
+                        submit_button = candidate
+                        break
+            except Exception:
+                continue
+            if submit_button:
+                break
+
+        if not submit_button:
+            try:
+                text_buttons = form.find_elements(
+                    By.XPATH,
+                    ".//*[self::button or @role='button']["
+                    "contains(translate(normalize-space(.), "
+                    "'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'send') or "
+                    "contains(translate(normalize-space(.), "
+                    "'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'submit') or "
+                    "contains(translate(normalize-space(.), "
+                    "'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'enquire') or "
+                    "contains(translate(normalize-space(.), "
+                    "'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'request quote')]"
+                )
+                submit_button = next(
+                    (button for button in text_buttons
+                     if button.is_displayed() and button.is_enabled()),
+                    None,
+                )
+            except Exception:
+                submit_button = None
+
+        clicked = False
+        if submit_button:
+            try:
+                self.driver.execute_script(
+                    "arguments[0].scrollIntoView({block:'center'});",
+                    submit_button,
+                )
+            except Exception:
+                pass
+            try:
+                submit_button.click()
+                clicked = True
+            except Exception:
+                try:
+                    self.driver.execute_script("arguments[0].click();", submit_button)
+                    clicked = True
+                except Exception as exc:
+                    self._log(f"Contact form submit-button error: {exc}")
+        else:
+            # requestSubmit preserves browser validation and submit handlers.
+            try:
+                clicked = bool(self.driver.execute_script(
+                    """
+                    const form = arguments[0];
+                    if (!form || !form.requestSubmit) return false;
+                    form.requestSubmit();
+                    return true;
+                    """,
+                    form,
+                ))
+            except Exception as exc:
+                self._log(f"Contact form submit control not found: {exc}")
+
+        if not clicked:
+            self._log("Contact form was filled, but no usable submit control was found.")
+            return "not_submitted"
+
+        self._log("Contact form submit action triggered.")
+        success_selectors = (
+            ".wpcf7-mail-sent-ok",
+            ".wpcf7-response-output",
+            ".wpforms-confirmation-container",
+            ".elementor-message-success",
+            ".form-success",
+            ".success-message",
+            ".alert-success",
+            "[role='alert']",
+        )
+        success_words = ("thank", "success", "sent", "received", "submitted")
+
+        def submission_outcome(driver):
+            try:
+                if before_url and str(driver.current_url or "") != before_url:
+                    return "submitted"
+            except Exception:
+                return "submitted"
+
+            try:
+                invalid = driver.execute_script(
+                    "return !!(arguments[0] && arguments[0].querySelector(':invalid'));",
+                    form,
+                )
+                if invalid:
+                    return "validation_failed"
+            except Exception:
+                # A detached form usually means an AJAX submission replaced it.
+                return "submitted"
+
+            for selector in success_selectors:
+                try:
+                    for element in driver.find_elements(By.CSS_SELECTOR, selector):
+                        text = str(element.text or "").strip().lower()
+                        if element.is_displayed() and any(word in text for word in success_words):
+                            return "submitted"
+                except Exception:
+                    continue
+            return False
+
+        try:
+            outcome = WebDriverWait(self.driver, 10, poll_frequency=0.25).until(
+                submission_outcome
+            )
+        except TimeoutException:
+            outcome = "clicked_unconfirmed"
+        except Exception as exc:
+            self._log(f"Contact form confirmation check error: {exc}")
+            outcome = "clicked_unconfirmed"
+
+        if outcome == "submitted":
+            self._log("Contact form submission confirmed.")
+        elif outcome == "validation_failed":
+            self._log("Contact form submission was blocked by a required field or validation.")
+        else:
+            self._log("Contact form was clicked once, but the website showed no clear confirmation.")
+        return outcome
+
+
     def fill_contact_form(
         self,
         name,
@@ -4586,6 +4746,12 @@ class Automation(GoogleResultsMixin, OutreachChannelsMixin):
             f"✓ Successfully filled "
             f"{filled_count} form fields."
         )
+
+        if bool(self.config.get("review_mode", True)):
+            self.last_form_submission_status = "review"
+            return True
+
+        self.last_form_submission_status = self.submit_contact_form(form)
 
         return True
 

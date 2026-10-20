@@ -548,6 +548,58 @@ class OutreachTests(unittest.TestCase):
         self.bot.fill_field_value=MagicMock(return_value=True)
         self.assertFalse(self.bot.fill_contact_form('Sender','sender@example.test','','Hello'))
 
+    def test_filled_form_is_submitted_when_review_mode_is_disabled(self):
+        form = MagicMock()
+        message_field = MagicMock()
+        self.bot.config['review_mode'] = False
+        self.bot.find_contact_form = MagicMock(return_value=form)
+        self.bot.find_form_field = MagicMock(
+            side_effect=[None, None, None, None, message_field]
+        )
+        self.bot.fill_field_value = MagicMock(return_value=True)
+        self.bot.submit_contact_form = MagicMock(return_value='submitted')
+
+        self.assertTrue(self.bot.fill_contact_form('', '', '', 'Hello'))
+
+        self.bot.submit_contact_form.assert_called_once_with(form)
+        self.assertEqual(self.bot.last_form_submission_status, 'submitted')
+
+    def test_review_mode_keeps_filled_form_without_submitting(self):
+        form = MagicMock()
+        message_field = MagicMock()
+        self.bot.config['review_mode'] = True
+        self.bot.find_contact_form = MagicMock(return_value=form)
+        self.bot.find_form_field = MagicMock(
+            side_effect=[None, None, None, None, message_field]
+        )
+        self.bot.fill_field_value = MagicMock(return_value=True)
+        self.bot.submit_contact_form = MagicMock()
+
+        self.assertTrue(self.bot.fill_contact_form('', '', '', 'Hello'))
+
+        self.bot.submit_contact_form.assert_not_called()
+        self.assertEqual(self.bot.last_form_submission_status, 'review')
+
+    def test_submit_contact_form_clicks_explicit_submit_only_once(self):
+        form = MagicMock()
+        button = MagicMock()
+        button.is_displayed.return_value = True
+        button.is_enabled.return_value = True
+        form.find_elements.side_effect = lambda _by, selector: (
+            [button] if selector == "button[type='submit']" else []
+        )
+        self.bot.driver.current_url = 'https://fixture.test/contact'
+
+        def click():
+            self.bot.driver.current_url = 'https://fixture.test/thank-you'
+
+        button.click.side_effect = click
+
+        outcome = self.bot.submit_contact_form(form)
+
+        self.assertEqual(outcome, 'submitted')
+        button.click.assert_called_once_with()
+
     def test_whatsapp_tries_second_number_without_losing_contacts(self):
         result=self.lead();result['phones']=['0501112222','0503334444']
         self.bot._send_whatsapp_to_phone=MagicMock(side_effect=[False,True])
