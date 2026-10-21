@@ -86,6 +86,9 @@ IMPORTANT:
 - Do not use excessive marketing language.
 - Do not use emojis.
 - Do not mention that AI wrote the message.
+- After the greeting, start the first sentence with "We". Do not open with
+  "Our team at [company name]" and do not repeat the sender company name in
+  the message body; use we, us, and our instead.
 - Invite them to contact us if they are interested.
 - Mention that we can discuss their requirements and provide suitable recommendations.
 - Infer the likely industry from the business name and profile context.
@@ -176,7 +179,8 @@ class Automation(GoogleResultsMixin, OutreachChannelsMixin):
             pass
 
     def __init__(self, mode="full", retry_business_key=""):
-        self.config = self.read_json(str(Path(get_app_dir()) / 'config.json'))
+        self.config_path = Path(get_app_dir()) / 'config.json'
+        self.config = self.read_json(str(self.config_path))
         self.mode = mode
         
 
@@ -271,6 +275,9 @@ class Automation(GoogleResultsMixin, OutreachChannelsMixin):
 
     def process_pending_channel(self, channel):
         """Send drafts that do not yet have a sent event for one channel."""
+        if channel == "email" and not self.email_sending_enabled():
+            self._log("Pending email run skipped: email sending is disabled in settings.")
+            return 0
         event_type = EVENT_WHATSAPP_SENT if channel == "whatsapp" else EVENT_EMAIL_SENT
         rows = self.db.execute(
             """SELECT o.*,
@@ -329,6 +336,9 @@ class Automation(GoogleResultsMixin, OutreachChannelsMixin):
 
     def process_retry_channel(self, channel, business_key):
         """Retry one saved draft without regenerating its proposal."""
+        if channel == "email" and not self.email_sending_enabled():
+            self._log("Email retry skipped: email sending is disabled in settings.")
+            return False
         if not business_key:
             raise ValueError("A business key is required for a retry")
         row = self.db.execute(
@@ -2387,18 +2397,20 @@ class Automation(GoogleResultsMixin, OutreachChannelsMixin):
             prompt += f"\n\nWEBSITE REVIEW:\nWebsite checked: {website_url or 'Website URL listed on Google'}"
             if audit_findings:
                 prompt += (
-                    "\nInternal homepage observations (for grounding only; do not quote, "
-                    "list, or expose these details to the customer):\n"
+                    "\nConfirmed homepage observations (use these as the only source for "
+                    "the website issues mentioned to the customer):\n"
                     + "\n".join(f"- {finding}" for finding in audit_findings)
-                    + "\n\nWrite a concise outreach message that summarizes the review only "
-                    "in broad customer-friendly terms, such as opportunities to improve "
-                    "SEO/search visibility, accessibility, mobile usability, or website "
-                    "security and trust, but only when supported by the internal observations. "
-                    "Do not mention exact issues, HTML tags or attributes, metadata names, "
-                    "protocols, technical checks, individual affected items, or any counts. "
-                    "Do not list the findings and do not provide a technical solution or "
-                    "step-by-step instructions. Simply explain that our team can review and "
-                    "fix the relevant website areas and invite them to discuss the work. "
+                    + "\n\nWrite a concise outreach message that says the website review found "
+                    "some issues and briefly names two or three of the confirmed issues. If "
+                    "only one issue was confirmed, mention only that issue and do not say "
+                    "that there are several. Translate each finding into clear, natural "
+                    "business language; for example, say that the homepage is missing a "
+                    "clear main heading or that its search-result description is missing. "
+                    "Do not replace the specific issues with only a broad phrase such as "
+                    "'SEO issues' or 'opportunities to improve.' Avoid raw HTML terminology, "
+                    "metadata names, protocols, audit language, and exact item counts. Do not "
+                    "provide a technical solution or step-by-step instructions. Explain that "
+                    "our team can fix these website issues and invite them to discuss the work. "
                     "Do not invent additional issue categories. "
                     "Do not claim the site is hacked, vulnerable, unsafe, penalized, or "
                     "non-responsive unless the confirmed observations explicitly prove it. "
@@ -2427,12 +2439,13 @@ class Automation(GoogleResultsMixin, OutreachChannelsMixin):
             )
         elif has_website:
             prompt += (
-                "\n\nKeep the message focused on the broad website improvement areas "
-                "supported by the review and one genuinely relevant dedicated-software idea. "
-                "Do not expose the underlying observations, replace the tailored idea with a "
-                "generic service list, or include a technical tutorial. Arrange the message "
-                "professionally: website review, tailored software opportunity, then a concise "
-                "question about website improvements, new or updated software, or both."
+                "\n\nKeep the message focused on the specific, customer-friendly website "
+                "issues supported by the review and one genuinely relevant dedicated-software "
+                "idea. Do not replace the confirmed issues with generic SEO language, replace "
+                "the tailored idea with a generic service list, or include a technical tutorial. "
+                "Arrange the message professionally: website issues, tailored software "
+                "opportunity, then a concise question about website improvements, new or "
+                "updated software, or both."
             )
         else:
             prompt += (
@@ -2457,6 +2470,12 @@ class Automation(GoogleResultsMixin, OutreachChannelsMixin):
             )
         if "return only" not in lower_prompt:
             final_rules.append("- Return ONLY the proposal text.")
+        if "our team at [company name]" not in lower_prompt:
+            final_rules.append(
+                "- After the greeting, start the first sentence with 'We'. Do not open "
+                "with 'Our team at [company name]' and do not repeat the sender company "
+                "name in the message body; use we, us, and our instead."
+            )
 
         if final_rules:
             prompt = f"{prompt}\n\nFINAL RULES:\n" + "\n".join(final_rules)
@@ -2475,7 +2494,7 @@ class Automation(GoogleResultsMixin, OutreachChannelsMixin):
             )
             if audit_findings and self.audit_message_exposes_details(message):
                 self._log(
-                    "AI draft exposed technical audit details; using the general customer summary."
+                    "AI draft exposed technical audit details; using the customer-friendly issue summary."
                 )
                 return self.fallback_outreach_message(website)
             return message
@@ -2516,17 +2535,19 @@ class Automation(GoogleResultsMixin, OutreachChannelsMixin):
                 if str(finding).strip()
             ][:4]
             if findings:
-                improvement_areas = self.audit_improvement_areas(findings)
-                if len(improvement_areas) == 1:
-                    areas_text = improvement_areas[0]
+                customer_issues = self.audit_customer_issues(findings)[:3]
+                if len(customer_issues) == 1:
+                    review_text = (
+                        "we identified an issue: " + customer_issues[0]
+                    )
                 else:
-                    areas_text = ", ".join(improvement_areas[:-1]) + f", and {improvement_areas[-1]}"
+                    issues_text = ", ".join(customer_issues[:-1]) + f", and {customer_issues[-1]}"
+                    review_text = "we identified several issues, including " + issues_text
                 return (
                     f"{greeting}\n\n"
-                    f"During a brief review of {website_url or 'your website'}, we identified "
-                    f"some opportunities to improve {areas_text}.\n\n"
-                    "Our team can review and update the relevant website areas without burdening "
-                    "you with technical details.\n\n"
+                    f"During a brief review of {website_url or 'your website'}, {review_text}.\n\n"
+                    "Our team can fix these website issues and improve the site's clarity, "
+                    "usability, and online presence.\n\n"
                     f"We can also develop {software_idea} to help streamline your day-to-day "
                     "operations. Would you be interested in discussing website improvements, "
                     "new or updated dedicated software, or both?"
@@ -2615,6 +2636,37 @@ class Automation(GoogleResultsMixin, OutreachChannelsMixin):
             if any(keyword in joined for keyword in keywords)
         ]
         return areas or ["overall website quality"]
+
+    @staticmethod
+    def audit_customer_issues(findings):
+        """Translate confirmed audit findings into concise customer-friendly issues."""
+        issue_checks = (
+            (("served over http",), "the site is not using a secure connection"),
+            (("does not provide a page title",), "the homepage is missing a search-result title"),
+            (("title is very short",), "the homepage title does not clearly describe the business"),
+            (("title is long",), "the homepage title may be cut off in search results"),
+            (("no meta description",), "the homepage is missing a search-result description"),
+            (("meta description is very short",), "the search-result description is too brief"),
+            (("meta description is long",), "the search-result description may be cut off"),
+            (("mobile viewport",), "mobile display settings are missing, which can affect phone usability"),
+            (("no main h1 heading",), "the homepage is missing a clear main heading"),
+            (("h1 headings",), "the homepage has an unclear main-heading structure"),
+            (("canonical url",), "search engines are not given a preferred homepage address"),
+            (("language is not declared",), "the page language is not specified for browsers and accessibility tools"),
+            (("missing descriptive alt text",), "some homepage images are missing accessibility descriptions"),
+            (("form", "insecure http"), "a website form sends information through an insecure connection"),
+            (("loads", "resource", "insecure http"), "some page content loads through an insecure connection"),
+        )
+        issues = []
+        for finding in findings:
+            text = str(finding or "").lower()
+            issue = next(
+                (label for keywords, label in issue_checks if all(keyword in text for keyword in keywords)),
+                "a confirmed homepage element needs attention",
+            )
+            if issue not in issues:
+                issues.append(issue)
+        return issues
 
     @staticmethod
     def audit_message_exposes_details(message):
@@ -2942,13 +2994,16 @@ class Automation(GoogleResultsMixin, OutreachChannelsMixin):
         if not result.get("_whatsapp_attempted") and not verified:
             verified = self.preflight_whatsapp(result, business_key)
 
-        email_recipients = self.email_recipients(result)
+        email_enabled = self.email_sending_enabled()
+        email_recipients = self.email_recipients(result) if email_enabled else []
         has_website = bool(
             website.get("url")
             or website.get("has_website")
             or website.get("website_redirect_url")
         )
-        if not email_recipients:
+        if not email_enabled:
+            self.channel_outcome(result, "email", "disabled", "Disabled in settings")
+        elif not email_recipients:
             self.channel_outcome(result, "email", "no_email", "No email address found")
         if not verified and not email_recipients and not has_website:
             return False
@@ -2969,7 +3024,7 @@ class Automation(GoogleResultsMixin, OutreachChannelsMixin):
 
         # Email is an additional channel, not a fallback. If an address was
         # discovered, attempt it even when WhatsApp succeeded or needs review.
-        if email_recipients:
+        if email_enabled and email_recipients:
             sent = self.send_email_message(result, business_key)
             if sent:
                 result["email_sent"] = True
@@ -3344,11 +3399,8 @@ class Automation(GoogleResultsMixin, OutreachChannelsMixin):
         return emails
 
     def _send_email_message(self, result, business_key):
-        if not self.get_bool_setting(
-            "email",
-            "enabled",
-            default=True
-        ):
+        # Defense in depth for callers that bypass send_email_message().
+        if not self.email_sending_enabled():
             return self.channel_outcome(result, "email", "disabled", "Disabled in settings")
 
         auto_send = self.get_bool_setting(

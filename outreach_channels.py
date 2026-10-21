@@ -7,6 +7,26 @@ from selenium.common.exceptions import TimeoutException
 
 
 class OutreachChannelsMixin:
+    def email_sending_enabled(self):
+        """Fail closed and honor config changes made during an active run."""
+        config = self.config
+        config_path = getattr(self, "config_path", None)
+        if config_path and hasattr(self, "read_json"):
+            # Treat a missing/unreadable live config as disabled. This is a
+            # safety switch, so stale in-memory settings must never win.
+            config = self.read_json(str(config_path))
+        if not isinstance(config, dict):
+            return False
+        section = config.get("email", {})
+        value = (
+            section.get("enabled", False)
+            if isinstance(section, dict)
+            else config.get("email_enabled", False)
+        )
+        if isinstance(value, bool):
+            return value
+        return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
     def never_repeat_contacted(self):
         campaign = self.config.get('campaign', {})
         return isinstance(campaign, dict) and bool(
@@ -138,6 +158,12 @@ class OutreachChannelsMixin:
         return False
 
     def send_email_message(self, result, business_key):
+        # Public guard: every SMTP path, including pending jobs and manual
+        # retries, must pass through an explicitly enabled email setting.
+        if not self.email_sending_enabled():
+            return self.channel_outcome(
+                result, 'email', 'disabled', 'Disabled in settings'
+            )
         recent = self.recent_channel_events(business_key, EVENT_EMAIL_SENT)
         recipients = self.email_recipients(result)
         globally_contacted = {

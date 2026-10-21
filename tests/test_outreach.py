@@ -217,9 +217,11 @@ class OutreachTests(unittest.TestCase):
         prompt=self.bot.ask_ai.call_args.args[0]
         self.assertIn('website checked: https://fixture.test',prompt.lower())
         self.assertIn('the homepage has no main h1 heading',prompt.lower())
-        self.assertIn('for grounding only',prompt.lower())
-        self.assertIn('do not mention exact issues',prompt.lower())
+        self.assertIn('briefly names two or three of the confirmed issues',prompt.lower())
+        self.assertIn('do not replace the specific issues',prompt.lower())
         self.assertIn('do not provide a technical solution',prompt.lower())
+        self.assertIn('start the first sentence with "we"',prompt.lower())
+        self.assertIn('our team at [company name]',prompt.lower())
 
     def test_ai_draft_that_exposes_audit_details_is_replaced_with_general_summary(self):
         self.bot.ask_ai=MagicMock(return_value=(
@@ -233,8 +235,8 @@ class OutreachTests(unittest.TestCase):
                 '44 of 50 homepage images are missing descriptive alt text.',
             ],
         })
-        self.assertIn('seo and search visibility',message.lower())
-        self.assertIn('accessibility and user experience',message.lower())
+        self.assertIn('missing a clear main heading',message.lower())
+        self.assertIn('images are missing accessibility descriptions',message.lower())
         self.assertNotIn('h1',message.lower())
         self.assertNotIn('alt text',message.lower())
         self.assertNotIn('44',message)
@@ -261,9 +263,9 @@ class OutreachTests(unittest.TestCase):
         self.assertIn('dedicated software concept',prompt)
         self.assertIn('streamline its operations',prompt)
         self.assertIn('website improvements, new or updated dedicated software, or both',prompt)
-        self.assertIn('do not mention exact issues',prompt)
+        self.assertIn('briefly names two or three of the confirmed issues',prompt)
 
-    def test_local_travel_message_combines_general_website_review_and_software(self):
+    def test_local_travel_message_combines_specific_website_issue_and_software(self):
         self.bot.config['use_browser_ai']=False
         message=self.bot.generate_website_proposal({
             'name':'Desert Sky Travel',
@@ -272,7 +274,7 @@ class OutreachTests(unittest.TestCase):
             'audit_findings':['The homepage has no main H1 heading.'],
         })
         lower=message.lower()
-        self.assertIn('seo and search visibility',lower)
+        self.assertIn('missing a clear main heading',lower)
         self.assertIn('travel-operations platform',lower)
         self.assertIn('bookings',lower)
         self.assertIn('itineraries',lower)
@@ -454,12 +456,12 @@ class OutreachTests(unittest.TestCase):
         })
         self.bot.ask_ai.assert_not_called()
         self.assertIn('https://fixture.test',message.lower())
-        self.assertIn('seo and search visibility',message.lower())
+        self.assertIn('missing a search-result description',message.lower())
         self.assertNotIn('meta description',message.lower())
         self.assertNotIn('h1',message.lower())
-        self.assertIn('review and update',message.lower())
+        self.assertIn('fix these website issues',message.lower())
 
-    def test_local_message_generalizes_multiple_findings_without_counts(self):
+    def test_local_message_names_multiple_customer_friendly_issues_without_counts(self):
         self.bot.config['use_browser_ai']=False
         message=self.bot.generate_website_proposal({
             'name':'General Trading',
@@ -469,8 +471,9 @@ class OutreachTests(unittest.TestCase):
                 '44 of 50 homepage images are missing descriptive alt text.',
             ],
         })
-        self.assertIn('seo and search visibility',message.lower())
-        self.assertIn('accessibility and user experience',message.lower())
+        self.assertIn('identified several issues',message.lower())
+        self.assertIn('missing a clear main heading',message.lower())
+        self.assertIn('images are missing accessibility descriptions',message.lower())
         self.assertNotIn('h1',message.lower())
         self.assertNotIn('alt text',message.lower())
         self.assertNotIn('44',message)
@@ -717,6 +720,56 @@ class OutreachTests(unittest.TestCase):
             self.bot.config['email'][setting]=True
         smtp.assert_not_called()
 
+    def test_missing_email_settings_fail_closed_without_smtp(self):
+        self.bot.config.pop('email')
+        smtp = self.smtp()
+        result = self.lead()
+        self.assertFalse(self.bot.send_email_message(result, 'key'))
+        self.assertEqual(result['channel_status']['email']['status'], 'disabled')
+        smtp.assert_not_called()
+
+    def test_live_email_kill_switch_overrides_running_process_config(self):
+        self.bot.config['email']['enabled'] = True
+        self.bot.config_path = self.bot.data_dir / 'live-config.json'
+        self.bot.config_path.write_text(
+            json.dumps({'email': {'enabled': False}}), encoding='utf-8'
+        )
+        smtp = self.smtp()
+        result = self.lead()
+        self.assertFalse(self.bot.send_email_message(result, 'key'))
+        self.assertFalse(self.bot._send_email_message(result, 'key'))
+        self.assertEqual(result['channel_status']['email']['status'], 'disabled')
+        smtp.assert_not_called()
+
+    def test_disabled_email_is_skipped_before_preferred_outreach_sender(self):
+        self.bot.config['email']['enabled'] = False
+        self.bot.preflight_whatsapp = MagicMock(return_value='')
+        self.bot.send_email_message = MagicMock()
+        result = {
+            'emails': ['hello@fixture.test'],
+            'phones': [],
+            'proposal': 'Saved message',
+            'channel_status': {},
+        }
+        self.assertFalse(self.bot.attempt_preferred_outreach(
+            result, {'name': 'Email disabled', 'url': 'https://fixture.test'}, 'key'
+        ))
+        self.bot.send_email_message.assert_not_called()
+        self.assertEqual(result['channel_status']['email']['status'], 'disabled')
+
+    def test_disabled_email_pending_and_retry_jobs_do_not_call_sender(self):
+        _site, key = self.seed('disabled-email-jobs')
+        self.bot.db.execute(
+            "UPDATE outreach SET emails=?, proposal=? WHERE business_key=?",
+            (json.dumps(['hello@fixture.test']), 'Saved message', key),
+        )
+        self.bot.db.commit()
+        self.bot.config['email']['enabled'] = False
+        self.bot.send_email_message = MagicMock()
+        self.assertEqual(self.bot.process_pending_channel('email'), 0)
+        self.assertFalse(self.bot.process_retry_channel('email', key))
+        self.bot.send_email_message.assert_not_called()
+
     def test_legacy_stats_add_missing_events_per_business_and_do_not_count_prefill_as_contact(self):
         self.seed('legacy','whatsapp_sent'); _, key=self.seed('modern')
         record_event(self.bot.db,'whatsapp_sent',key)
@@ -749,6 +802,7 @@ class OutreachTests(unittest.TestCase):
         state = {'pid': 321, 'mode': 'retry-email', 'status': 'running'}
         with patch('web_app.data_dir', return_value=self.bot.data_dir), \
              patch('web_app.job_status', return_value={}), \
+             patch('web_app.email_sending_enabled', return_value=True), \
              patch('web_app.start_process', return_value=state) as start, \
              patch('web_app.authenticated', return_value=True):
             client = web_app.app.test_client()
@@ -769,12 +823,32 @@ class OutreachTests(unittest.TestCase):
         record_event(self.bot.db, 'email_sent', key, recipient='hello@fixture.test')
         with patch('web_app.data_dir', return_value=self.bot.data_dir), \
              patch('web_app.job_status', return_value={}), \
+             patch('web_app.email_sending_enabled', return_value=True), \
              patch('web_app.start_process') as start, \
              patch('web_app.authenticated', return_value=True):
             response = web_app.app.test_client().post(
                 f'/api/leads/{key}/retry', json={'channel': 'email'}
             )
         self.assertEqual(response.status_code, 409)
+        start.assert_not_called()
+
+    def test_web_dashboard_rejects_email_jobs_when_disabled(self):
+        _site, key = self.seed('disabled-web-email')
+        self.bot.db.execute(
+            "UPDATE outreach SET emails=?, proposal=? WHERE business_key=?",
+            (json.dumps(['hello@fixture.test']), 'Saved message', key),
+        )
+        self.bot.db.commit()
+        with patch('web_app.data_dir', return_value=self.bot.data_dir), \
+             patch('web_app.job_status', return_value={}), \
+             patch('web_app.email_sending_enabled', return_value=False), \
+             patch('web_app.start_process') as start, \
+             patch('web_app.authenticated', return_value=True):
+            client = web_app.app.test_client()
+            pending = client.post('/api/jobs/start', json={'mode': 'pending-email'})
+            retry = client.post(f'/api/leads/{key}/retry', json={'channel': 'email'})
+        self.assertEqual(pending.status_code, 409)
+        self.assertEqual(retry.status_code, 409)
         start.assert_not_called()
 
     def test_single_lead_retry_reuses_saved_proposal_and_preserves_other_channel(self):

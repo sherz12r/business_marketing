@@ -55,6 +55,15 @@ def load_config():
         return {}
 
 
+def email_sending_enabled():
+    """Return true only when email is explicitly enabled in config.json."""
+    section = load_config().get("email", {})
+    value = section.get("enabled", False) if isinstance(section, dict) else False
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
 def save_config(config):
     """Persist dashboard settings without leaving a partially written JSON file."""
     temporary = CONFIG_PATH.with_suffix(".tmp")
@@ -268,6 +277,8 @@ def start_job():
         return jsonify({"error": "An automation job is already running."}), 409
 
     mode = (request.get_json(silent=True) or {}).get("mode", "full")
+    if mode == "pending-email" and not email_sending_enabled():
+        return jsonify({"error": "Email sending is disabled in settings."}), 409
     arguments = {
         "full": [],
         "pending-email": ["--pending-email"],
@@ -290,6 +301,8 @@ def retry_lead(business_key):
     channel = str((request.get_json(silent=True) or {}).get("channel", "")).lower()
     if channel not in {"email", "whatsapp"}:
         return jsonify({"error": "Choose email or WhatsApp."}), 400
+    if channel == "email" and not email_sending_enabled():
+        return jsonify({"error": "Email sending is disabled in settings."}), 409
 
     with closing(database()) as connection:
         row = connection.execute(

@@ -83,6 +83,9 @@ IMPORTANT:
 - Do not use excessive marketing language.
 - Do not use emojis.
 - Do not mention that AI wrote the message.
+- After the greeting, start the first sentence with "We". Do not open with
+  "Our team at [company name]" and do not repeat the sender company name in
+  the message body; use we, us, and our instead.
 - Invite them to contact us if they are interested.
 - Mention that we can discuss their requirements and provide suitable recommendations.
 - Infer the likely industry from the business name and profile context.
@@ -1246,6 +1249,15 @@ class MarketingDashboard(tk.Tk):
         open_path(self.data_dir() / "outreach_drafts.csv")
 
     def start_bot(self, mode="full", label="automation"):
+        if mode == "pending-email":
+            email_config = read_json(CONFIG_PATH).get("email", {})
+            if not isinstance(email_config, dict) or not to_bool(email_config.get("enabled", False)):
+                messagebox.showwarning(
+                    "Email sending disabled",
+                    "Enable email sending in Settings before starting the pending email queue.",
+                )
+                self.status_var.set("Email sending is disabled")
+                return
         if self.is_running():
             self.status_var.set("Automation already running")
             return
