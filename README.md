@@ -208,6 +208,12 @@ If any of those are unavailable, host the dashboard/email worker on cPanel and r
 
 The phone is only controlling the server. Keep the VPS online while jobs run. If a WhatsApp login, CAPTCHA, or manual-review screen is required, connect to the server's graphical session; that browser screen is not streamed into the mobile dashboard.
 
+## LinkedIn campaign workflow
+
+The desktop dashboard includes a human-reviewed LinkedIn channel. **Run LinkedIn Bot** opens a LinkedIn people search in a separate Chrome window using the same persistent `chrome_profile_dir` as the rest of the system; LinkedIn requests sign-in in its own page when required. The default search is `Co Founder and CEO`, configurable under **Settings → LinkedIn → People Search Keywords**. Select a lead and choose **LinkedIn Details** to add the founder/owner name, role, business type, and LinkedIn profile URL. The dashboard creates a short draft from the lead's saved business and website analysis and uses the same sender company, contact name, email, phone, and website configured on the **Company** settings tab. Review the draft, open LinkedIn, copy it, send it manually, and then choose **Mark LinkedIn Sent**.
+
+The application does not request or store LinkedIn credentials and does not scrape profiles or automate sending. Sign in directly on LinkedIn. If no profile URL is saved, **Open LinkedIn** opens a people search for the selected business so you can choose the appropriate person yourself.
+
 ## Updating the server
 
 Back up the database and configuration before deploying an update:

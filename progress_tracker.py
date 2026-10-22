@@ -13,6 +13,7 @@ EVENT_WEBSITE_OPENED = "website_opened"
 EVENT_FORM_PREFILLED = "form_prefilled"
 EVENT_EMAIL_SENT = "email_sent"
 EVENT_WHATSAPP_SENT = "whatsapp_sent"
+EVENT_LINKEDIN_SENT = "linkedin_sent"
 
 
 def database_path(data_dir: Union[str, Path] = "data") -> Path:
@@ -35,7 +36,13 @@ def ensure_outreach_schema(connection: sqlite3.Connection) -> None:
         )"""
     )
     columns = {row[1] for row in connection.execute('PRAGMA table_info(outreach)')}
-    for name in ('channel_status', 'whatsapp_phones', 'last_error', 'area_key'):
+    text_columns = (
+        'channel_status', 'whatsapp_phones', 'last_error', 'area_key',
+        'business_context', 'linkedin_profile_url', 'linkedin_contact_name',
+        'linkedin_contact_role', 'linkedin_business_type', 'linkedin_draft',
+        'linkedin_updated_at',
+    )
+    for name in text_columns:
         if name not in columns:
             connection.execute(f"ALTER TABLE outreach ADD COLUMN {name} TEXT DEFAULT ''")
     connection.commit()
@@ -148,28 +155,43 @@ def record_event(
 
 def outreach_stats(connection):
     """One source of truth for both dashboards; totals never use a UI row limit."""
-    rows = connection.execute('SELECT business_key, status, form_prefilled, emails, phones FROM outreach').fetchall()
+    rows = connection.execute(
+        '''SELECT business_key, status, form_prefilled, emails, phones,
+                  linkedin_profile_url, linkedin_draft
+           FROM outreach'''
+    ).fetchall()
     events = connection.execute('SELECT business_key, event_type, COUNT(*) FROM outreach_events GROUP BY business_key, event_type').fetchall()
     by_business = {}
     totals = {}
     for key, event, count in events:
         by_business.setdefault(key, {})[event] = count
         totals[event] = totals.get(event, 0) + count
-    contacted = contacts = drafts = 0
-    for key, status, form, emails, phones in rows:
+    contacted = contacts = drafts = linkedin_drafts = 0
+    for key, status, form, emails, phones, linkedin_profile, linkedin_draft in rows:
         history = by_business.get(key, {})
         email = bool(history.get(EVENT_EMAIL_SENT)) or status in {'email_sent', 'fallback_sent'}
         whatsapp = bool(history.get(EVENT_WHATSAPP_SENT)) or status in {'whatsapp_sent', 'fallback_sent'}
-        contacted += int(email or whatsapp or status in {'submitted', 'sent'})
-        for event, legacy in [(EVENT_EMAIL_SENT, email), (EVENT_WHATSAPP_SENT, whatsapp), (EVENT_FORM_PREFILLED, form)]:
+        linkedin = bool(history.get(EVENT_LINKEDIN_SENT))
+        contacted += int(email or whatsapp or linkedin or status in {'submitted', 'sent'})
+        for event, legacy in [
+            (EVENT_EMAIL_SENT, email),
+            (EVENT_WHATSAPP_SENT, whatsapp),
+            (EVENT_LINKEDIN_SENT, linkedin),
+            (EVENT_FORM_PREFILLED, form),
+        ]:
             if legacy and not history.get(event):
                 totals[event] = totals.get(event, 0) + 1
-        contacts += int(any(value and value not in ('[]', 'null') for value in (emails, phones)))
+        contacts += int(any(
+            value and value not in ('[]', 'null')
+            for value in (emails, phones, linkedin_profile)
+        ))
         drafts += int(status == 'draft_ready')
+        linkedin_drafts += int(bool(str(linkedin_draft or '').strip()))
     stats = dict(businesses=len(rows), contacted=contacted, pending=len(rows)-contacted,
                  websites=totals.get(EVENT_WEBSITE_OPENED, 0), forms=totals.get(EVENT_FORM_PREFILLED, 0),
                  emails=totals.get(EVENT_EMAIL_SENT, 0), whatsapp=totals.get(EVENT_WHATSAPP_SENT, 0),
-                 contacts=contacts, drafts=drafts)
+                 linkedin=totals.get(EVENT_LINKEDIN_SENT, 0),
+                 linkedin_drafts=linkedin_drafts, contacts=contacts, drafts=drafts)
     cursor = connection.execute('SELECT * FROM outreach_runs ORDER BY id DESC LIMIT 1')
     raw = cursor.fetchone()
     run = dict(zip([col[0] for col in cursor.description], raw)) if raw else {}

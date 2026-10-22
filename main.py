@@ -1157,6 +1157,12 @@ class Automation(GoogleResultsMixin, OutreachChannelsMixin):
         result = {
             "name": name,
             "website": url,
+            "business_context": (
+                website.get("profile_text")
+                or website.get("category")
+                or self.search_query
+                or ""
+            ),
             "contact_page": "",
             "emails": list(dict.fromkeys(website.get("emails", []))),
             "phones": profile_phones[:],
@@ -3647,21 +3653,27 @@ class Automation(GoogleResultsMixin, OutreachChannelsMixin):
         self.db.execute(
             '''INSERT INTO outreach (
                 business_key, business_name, website, contact_page, emails,
-                phones, proposal, form_prefilled, status, updated_at, area_key
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                phones, proposal, form_prefilled, status, updated_at, area_key,
+                business_context
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(business_key) DO UPDATE SET
                 business_name=excluded.business_name, website=excluded.website,
                 contact_page=excluded.contact_page, emails=excluded.emails,
                 phones=excluded.phones, proposal=excluded.proposal,
                 form_prefilled=excluded.form_prefilled, status=excluded.status,
                 updated_at=excluded.updated_at,
-                area_key=CASE WHEN outreach.area_key='' THEN excluded.area_key ELSE outreach.area_key END''',
+                area_key=CASE WHEN outreach.area_key='' THEN excluded.area_key ELSE outreach.area_key END,
+                business_context=CASE
+                    WHEN excluded.business_context<>'' THEN excluded.business_context
+                    ELSE outreach.business_context
+                END''',
             (
                 business_key, result.get("name", ""), result.get("website", ""),
                 result.get("contact_page", ""), json.dumps(result.get("emails", [])),
                 json.dumps(result.get("phones", [])), result.get("proposal", ""),
                 int(result.get("form_prefilled", False)), result.get("status", "draft_ready"),
-                datetime.now().isoformat(timespec="seconds"), result.get("area_key", "")
+                datetime.now().isoformat(timespec="seconds"), result.get("area_key", ""),
+                result.get("business_context", "")
             )
         )
         self.db.execute('UPDATE outreach SET channel_status=?,whatsapp_phones=?,last_error=? WHERE business_key=?',

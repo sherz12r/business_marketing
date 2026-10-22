@@ -5,6 +5,7 @@ from contextlib import closing
 import os
 import queue
 import re
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -22,6 +23,7 @@ from process_utils import process_running
 from progress_tracker import (
     EVENT_EMAIL_SENT,
     EVENT_FORM_PREFILLED,
+    EVENT_LINKEDIN_SENT,
     EVENT_WEBSITE_OPENED,
     EVENT_WHATSAPP_SENT,
     ensure_database,
@@ -112,9 +114,18 @@ IMPORTANT:
 
 Return ONLY the proposal text."""
 
+DEFAULT_LINKEDIN_TEMPLATE = """{greeting}
+
+I came across {business_name}{business_type_phrase}{role_phrase}. {proposal_summary}
+
+Would you be open to connecting for a brief conversation?
+
+{sender_signature}"""
+
 DEFAULT_CONFIG = {
     "headless": False,
     "chrome_profile_dir": "chrome_profile",
+    "chrome_binary": "",
     "chatgpt_profile_dir": "chatgpt_profile",
     "search_query": "business near me",
     "limit": 10,
@@ -164,6 +175,13 @@ DEFAULT_CONFIG = {
         "image_only": False,
         "image_path": "",
     },
+    "linkedin": {
+        "enabled": True,
+        "include_contact_details": True,
+        "search_keywords": "Co Founder and CEO",
+        "max_message_chars": 600,
+        "message_template": DEFAULT_LINKEDIN_TEMPLATE,
+    },
     "email": {
         "enabled": True,
         "auto_send": True,
@@ -198,6 +216,7 @@ SETTINGS_SECTIONS = [
             {"path": ("reprocess_after_days",), "label": "Allow Again After Days", "type": "int", "min": 1},
             {"path": ("data_dir",), "label": "Data Folder", "type": "text"},
             {"path": ("chrome_profile_dir",), "label": "Chrome Profile Folder", "type": "text"},
+            {"path": ("chrome_binary",), "label": "Chrome Executable (Optional)", "type": "file"},
             {"path": ("chatgpt_profile_dir",), "label": "ChatGPT Profile Folder", "type": "text"},
             {"path": ("openai_model",), "label": "OpenAI Model", "type": "text"},
         ],
@@ -262,6 +281,16 @@ SETTINGS_SECTIONS = [
             {"path": ("whatsapp", "invalid_number_pause_seconds"), "label": "Invalid Number Pause Seconds", "type": "int", "min": 0},
             {"path": ("whatsapp", "default_country_code"), "label": "Default Country Code", "type": "text"},
             {"path": ("whatsapp", "ignore_phone_prefixes"), "label": "Ignored Phone Prefixes", "type": "list", "height": 5},
+        ],
+    ),
+    (
+        "LinkedIn",
+        [
+            {"path": ("linkedin", "enabled"), "label": "Enabled", "type": "bool"},
+            {"path": ("linkedin", "include_contact_details"), "label": "Use Shared Company Contact Details", "type": "bool"},
+            {"path": ("linkedin", "search_keywords"), "label": "People Search Keywords", "type": "text"},
+            {"path": ("linkedin", "max_message_chars"), "label": "Maximum Draft Characters", "type": "int", "min": 100, "max": 5000},
+            {"path": ("linkedin", "message_template"), "label": "Message Template", "type": "textarea", "height": 14},
         ],
     ),
     (
@@ -374,6 +403,166 @@ def join_short(items, limit=2):
     visible = items[:limit]
     suffix = "" if len(items) <= limit else f" +{len(items) - limit}"
     return shorten("; ".join(visible), 52) + suffix
+
+
+def normalize_linkedin_url(value):
+    """Return a safe LinkedIn URL without accepting arbitrary destinations."""
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    if not re.match(r"^https?://", text, flags=re.IGNORECASE):
+        text = "https://" + text.lstrip("/")
+    parsed = urlparse(text)
+    host = (parsed.hostname or "").lower()
+    if host != "linkedin.com" and not host.endswith(".linkedin.com"):
+        raise ValueError("Enter a linkedin.com profile URL.")
+    if parsed.scheme.lower() not in {"http", "https"}:
+        raise ValueError("Enter a valid LinkedIn profile URL.")
+    return text
+
+
+def linkedin_people_search_url(keywords):
+    search_text = str(keywords or "").strip() or "Co Founder and CEO"
+    return (
+        "https://www.linkedin.com/search/results/people/"
+        f"?keywords={quote_plus(search_text)}&origin=SWITCH_SEARCH_VERTICAL"
+    )
+
+
+def find_chrome_executable(config):
+    """Locate Chrome while allowing an explicit executable in Settings."""
+    configured = str(config.get("chrome_binary", "") or "").strip()
+    candidates = []
+    if configured:
+        configured_path = Path(configured).expanduser()
+        if not configured_path.is_absolute():
+            configured_path = APP_DIR / configured_path
+        candidates.append(configured_path)
+
+    for executable_name in ("chrome.exe", "chrome", "google-chrome", "chromium", "chromium-browser"):
+        discovered = shutil.which(executable_name)
+        if discovered:
+            candidates.append(Path(discovered))
+
+    if sys.platform.startswith("win"):
+        for environment_name in ("LOCALAPPDATA", "PROGRAMFILES", "PROGRAMFILES(X86)"):
+            base = os.environ.get(environment_name)
+            if base:
+                candidates.append(Path(base) / "Google" / "Chrome" / "Application" / "chrome.exe")
+
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate.resolve()
+    return None
+
+
+def proposal_summary_for_linkedin(proposal, limit=300):
+    """Turn the existing analyzed proposal into a compact LinkedIn summary."""
+    lines = []
+    for raw_line in str(proposal or "").splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if line.lower().startswith("contact details:"):
+            break
+        if not lines and re.match(r"^(hi|hello|dear)\b", line, re.IGNORECASE):
+            continue
+        lines.append(line)
+    text = " ".join(lines)
+    if not text:
+        return (
+            "I would like to explore whether our software and digital services "
+            "could support your business goals."
+        )
+    sentences = re.split(r"(?<=[.!?])\s+", text)
+    summary = " ".join(sentence for sentence in sentences[:2] if sentence).strip()
+    return shorten(summary or text, limit)
+
+
+def build_linkedin_message(row, config, contact_name="", contact_role="", business_type=""):
+    linkedin_config = config.get("linkedin", {}) if isinstance(config, dict) else {}
+    if not isinstance(linkedin_config, dict):
+        linkedin_config = {}
+    max_chars = max(100, min(5000, int(linkedin_config.get("max_message_chars", 600) or 600)))
+    template = str(
+        linkedin_config.get("message_template") or DEFAULT_LINKEDIN_TEMPLATE
+    ).strip()
+    first_name = str(contact_name or "").strip().split(" ", 1)[0]
+    greeting = f"Hi {first_name}," if first_name else "Hello,"
+    business_name = str(row.get("business_name") or "this business").strip()
+    inferred_type = str(
+        business_type
+        or row.get("linkedin_business_type")
+        or row.get("business_context")
+        or ""
+    ).replace("\n", " ").strip()
+    if inferred_type.lower() in {"business near me", "businesses near me"}:
+        inferred_type = ""
+    inferred_type = shorten(inferred_type, 80)
+    sender_name = str(config.get("contact_name", "") or "").strip()
+    sender_company = str(config.get("company_name", "") or "").strip()
+    sender_email = str(config.get("contact_email", "") or "").strip()
+    sender_phone = str(config.get("contact_phone", "") or "").strip()
+    sender_website = str(config.get("company_website", "") or "").strip()
+    signature_lines = []
+    if to_bool(linkedin_config.get("include_contact_details", True)):
+        if sender_name:
+            signature_lines.extend(["Best,", sender_name])
+        elif sender_company:
+            signature_lines.append("Regards,")
+        if sender_company:
+            signature_lines.append(sender_company)
+        if sender_email:
+            signature_lines.append(sender_email)
+        if sender_phone:
+            signature_lines.append(sender_phone)
+        if sender_website:
+            signature_lines.append(sender_website)
+    sender_signature = "\n".join(signature_lines)
+    values = {
+        "greeting": greeting,
+        "first_name": first_name,
+        "contact_name": str(contact_name or "").strip(),
+        "contact_role": str(contact_role or "").strip(),
+        "role_phrase": (
+            f" and noticed your role as {str(contact_role).strip()}"
+            if str(contact_role or "").strip()
+            else ""
+        ),
+        "business_name": business_name,
+        "business_type": inferred_type,
+        "business_type_phrase": f", which works in {inferred_type}" if inferred_type else "",
+        "website": str(row.get("website") or "").strip(),
+        "proposal_summary": proposal_summary_for_linkedin(row.get("proposal"), 320),
+        "sender_name": sender_name,
+        "sender_company": sender_company,
+        "sender_email": sender_email,
+        "sender_phone": sender_phone,
+        "sender_website": sender_website,
+        "sender_signature": sender_signature,
+    }
+    try:
+        message = template.format(**values)
+    except (KeyError, ValueError):
+        message = DEFAULT_LINKEDIN_TEMPLATE.format(**values)
+    if sender_signature and "{sender_signature}" not in template and sender_signature not in message:
+        message = f"{message.rstrip()}\n\n{sender_signature}"
+    message = re.sub(r"[ \t]+", " ", message)
+    message = re.sub(r"\n{3,}", "\n\n", message).strip()
+    if len(message) <= max_chars:
+        return message
+    if sender_signature and message.endswith(sender_signature):
+        body = message[: -len(sender_signature)].rstrip()
+        available = max_chars - len(sender_signature) - 5
+        if available >= 40:
+            clipped_body = body[:available].rstrip()
+            if " " in clipped_body:
+                clipped_body = clipped_body.rsplit(" ", 1)[0]
+            return clipped_body.rstrip(".,;:") + "...\n\n" + sender_signature
+    clipped = message[: max_chars - 3].rstrip()
+    if " " in clipped:
+        clipped = clipped.rsplit(" ", 1)[0]
+    return clipped.rstrip(".,;:") + "..."
 
 
 def domain_from_url(url):
@@ -654,6 +843,205 @@ def parse_settings_list(value):
     return [part.strip() for part in re.split(r"[\n;,]+", text) if part.strip()]
 
 
+class LinkedInLeadDialog(tk.Toplevel):
+    """Human-reviewed LinkedIn draft editor; it never collects credentials."""
+
+    def __init__(self, parent, row):
+        super().__init__(parent)
+        self.parent = parent
+        self.row = row
+        self.title(f"LinkedIn Campaign - {row['business_name']}")
+        self.geometry("720x700")
+        self.minsize(620, 560)
+        self.configure(bg=COLORS["bg"])
+        self.transient(parent)
+
+        self.contact_name_var = tk.StringVar(value=row.get("linkedin_contact_name", ""))
+        self.contact_role_var = tk.StringVar(value=row.get("linkedin_contact_role", ""))
+        self.business_type_var = tk.StringVar(value=row.get("linkedin_business_type", ""))
+        self.profile_url_var = tk.StringVar(value=row.get("linkedin_profile_url", ""))
+        self.character_count_var = tk.StringVar(value="0 characters")
+
+        self.build_layout()
+        self.draft_text.insert("1.0", row.get("linkedin_draft", ""))
+        self.draft_text.edit_modified(False)
+        self.update_character_count()
+        self.grab_set()
+
+    def build_layout(self):
+        shell = tk.Frame(self, bg=COLORS["bg"], padx=20, pady=18)
+        shell.pack(fill="both", expand=True)
+
+        tk.Label(
+            shell,
+            text="LinkedIn Campaign Draft",
+            bg=COLORS["bg"],
+            fg=COLORS["text"],
+            font=("Segoe UI", 18, "bold"),
+        ).pack(anchor="w")
+        tk.Label(
+            shell,
+            text=(
+                f"{self.row['business_name']}\n"
+                "Sign in directly on LinkedIn. This tool prepares the message but does not "
+                "store credentials or send automatically."
+            ),
+            bg=COLORS["bg"],
+            fg=COLORS["muted"],
+            font=("Segoe UI", 9),
+            justify="left",
+            wraplength=650,
+        ).pack(anchor="w", pady=(5, 14))
+
+        fields = tk.Frame(shell, bg=COLORS["panel"], padx=14, pady=12)
+        fields.pack(fill="x")
+        fields.grid_columnconfigure(1, weight=1)
+        entries = [
+            ("Contact name", self.contact_name_var),
+            ("Role (founder, owner, etc.)", self.contact_role_var),
+            ("Business type", self.business_type_var),
+            ("LinkedIn profile URL", self.profile_url_var),
+        ]
+        for index, (label, variable) in enumerate(entries):
+            tk.Label(
+                fields,
+                text=label,
+                bg=COLORS["panel"],
+                fg=COLORS["muted"],
+                font=("Segoe UI", 9, "bold"),
+            ).grid(row=index, column=0, sticky="w", padx=(0, 12), pady=6)
+            tk.Entry(
+                fields,
+                textvariable=variable,
+                bg=COLORS["panel_2"],
+                fg=COLORS["text"],
+                insertbackground=COLORS["text"],
+                relief="flat",
+                font=("Segoe UI", 10),
+            ).grid(row=index, column=1, sticky="ew", pady=6, ipady=6)
+
+        draft_header = tk.Frame(shell, bg=COLORS["bg"])
+        draft_header.pack(fill="x", pady=(14, 6))
+        tk.Label(
+            draft_header,
+            text="Personalized message",
+            bg=COLORS["bg"],
+            fg=COLORS["text"],
+            font=("Segoe UI", 11, "bold"),
+        ).pack(side="left")
+        tk.Label(
+            draft_header,
+            textvariable=self.character_count_var,
+            bg=COLORS["bg"],
+            fg=COLORS["muted"],
+            font=("Segoe UI", 9),
+        ).pack(side="right")
+
+        draft_frame = tk.Frame(shell, bg=COLORS["panel"])
+        draft_frame.pack(fill="both", expand=True)
+        self.draft_text = tk.Text(
+            draft_frame,
+            bg=COLORS["panel"],
+            fg=COLORS["text"],
+            insertbackground=COLORS["text"],
+            relief="flat",
+            wrap="word",
+            padx=12,
+            pady=10,
+            font=("Segoe UI", 10),
+        )
+        draft_scrollbar = ttk.Scrollbar(draft_frame, orient="vertical", command=self.draft_text.yview)
+        self.draft_text.configure(yscrollcommand=draft_scrollbar.set)
+        self.draft_text.pack(side="left", fill="both", expand=True)
+        draft_scrollbar.pack(side="right", fill="y")
+        self.draft_text.bind("<<Modified>>", self.update_character_count)
+
+        tk.Label(
+            shell,
+            text=(
+                "Generate uses the saved website/business analysis. Review every draft before "
+                "copying it to LinkedIn."
+            ),
+            bg=COLORS["bg"],
+            fg=COLORS["muted"],
+            font=("Segoe UI", 9),
+            wraplength=650,
+            justify="left",
+        ).pack(anchor="w", pady=(8, 12))
+
+        actions = tk.Frame(shell, bg=COLORS["bg"])
+        actions.pack(fill="x")
+        self.parent.make_button(actions, "Generate Draft", self.generate_draft, COLORS["accent_2"]).pack(side="left")
+        self.parent.make_button(actions, "Copy", self.copy_draft, COLORS["panel_3"]).pack(side="left", padx=(8, 0))
+        self.parent.make_button(actions, "Close", self.destroy, COLORS["panel_3"]).pack(side="right")
+        self.parent.make_button(actions, "Save", self.save, COLORS["accent"]).pack(side="right", padx=(0, 8))
+        self.parent.make_button(actions, "Save & Open", self.save_and_open, COLORS["warning"]).pack(side="right", padx=(0, 8))
+
+    def values(self):
+        return {
+            "contact_name": self.contact_name_var.get().strip(),
+            "contact_role": self.contact_role_var.get().strip(),
+            "business_type": self.business_type_var.get().strip(),
+            "profile_url": self.profile_url_var.get().strip(),
+            "draft": self.draft_text.get("1.0", "end").strip(),
+        }
+
+    def generate_draft(self):
+        values = self.values()
+        draft = self.parent.generate_linkedin_draft(
+            self.row,
+            values["contact_name"],
+            values["contact_role"],
+            values["business_type"],
+        )
+        self.draft_text.delete("1.0", "end")
+        self.draft_text.insert("1.0", draft)
+        self.draft_text.edit_modified(False)
+        self.update_character_count()
+
+    def update_character_count(self, _event=None):
+        if not hasattr(self, "draft_text"):
+            return
+        count = len(self.draft_text.get("1.0", "end-1c"))
+        self.character_count_var.set(f"{count} characters")
+        self.draft_text.edit_modified(False)
+
+    def save(self):
+        try:
+            saved = self.parent.save_linkedin_details(self.row, self.values())
+        except ValueError as exc:
+            messagebox.showerror("LinkedIn details", str(exc), parent=self)
+            return False
+        if saved:
+            self.row = self.parent.row_by_key.get(self.row["business_key"], self.row)
+        return saved
+
+    def copy_draft(self):
+        draft = self.draft_text.get("1.0", "end").strip()
+        if not draft:
+            messagebox.showinfo("No draft", "Generate or enter a message first.", parent=self)
+            return
+        self.parent.copy_to_clipboard(draft, "LinkedIn draft copied")
+
+    def save_and_open(self):
+        if not self.save():
+            return
+        profile_url = self.parent.row_by_key.get(
+            self.row["business_key"], self.row
+        ).get("linkedin_profile_url", "")
+        if not profile_url:
+            messagebox.showinfo(
+                "Profile URL required",
+                "Add the person's LinkedIn profile URL before opening it.",
+                parent=self,
+            )
+            return
+        self.parent.open_in_bot_chrome(
+            profile_url,
+            "LinkedIn profile opened for manual review",
+        )
+
+
 class MarketingDashboard(tk.Tk):
     def __init__(self):
         super().__init__()
@@ -684,6 +1072,9 @@ class MarketingDashboard(tk.Tk):
 
         self.load_data()
         self.load_recent_log_file()
+        # The embedded dashboard is taller than the viewport.  Wait until Tk
+        # finishes its first geometry pass, then make sure it opens at the top.
+        self.after_idle(self._scroll_page_to_top)
         self.after(250, self.poll_process_output)
         self.after(3000, self.auto_refresh)
 
@@ -722,12 +1113,65 @@ class MarketingDashboard(tk.Tk):
         )
 
     def build_layout(self):
-        shell = tk.Frame(self, bg=COLORS["bg"], padx=22, pady=18)
-        shell.pack(fill="both", expand=True)
+        page = tk.Frame(self, bg=COLORS["bg"])
+        page.pack(fill="both", expand=True)
+
+        self.page_canvas = tk.Canvas(
+            page,
+            bg=COLORS["bg"],
+            highlightthickness=0,
+            borderwidth=0,
+        )
+        page_scrollbar = ttk.Scrollbar(
+            page,
+            orient="vertical",
+            command=self.page_canvas.yview,
+        )
+        self.page_canvas.configure(yscrollcommand=page_scrollbar.set)
+
+        shell = tk.Frame(self.page_canvas, bg=COLORS["bg"], padx=22, pady=18)
+        self.page_window = self.page_canvas.create_window(
+            (0, 0),
+            window=shell,
+            anchor="nw",
+        )
+
+        self.page_canvas.pack(side="left", fill="both", expand=True)
+        page_scrollbar.pack(side="right", fill="y")
+
+        shell.bind("<Configure>", self._update_page_scroll_region)
+        self.page_canvas.bind("<Configure>", self._resize_page_content)
 
         self.build_header(shell)
         self.build_stats(shell)
         self.build_body(shell)
+        self._bind_page_mousewheel(shell)
+
+    def _update_page_scroll_region(self, _event=None):
+        """Keep the page scrollbar in sync with the dashboard's full height."""
+        self.page_canvas.configure(scrollregion=self.page_canvas.bbox("all"))
+
+    def _resize_page_content(self, event):
+        """Make the scrollable dashboard track the available window width."""
+        self.page_canvas.itemconfigure(self.page_window, width=event.width)
+
+    def _scroll_page_to_top(self):
+        self.page_canvas.configure(scrollregion=self.page_canvas.bbox("all"))
+        self.page_canvas.yview_moveto(0.0)
+
+    def _bind_page_mousewheel(self, widget):
+        """Scroll the page from ordinary controls without hijacking nested lists."""
+        nested_scrollers = (tk.Text, tk.Listbox, ttk.Treeview, tk.Canvas)
+        if not isinstance(widget, nested_scrollers):
+            widget.bind("<MouseWheel>", self._on_page_mousewheel, add="+")
+        for child in widget.winfo_children():
+            self._bind_page_mousewheel(child)
+
+    def _on_page_mousewheel(self, event):
+        if event.delta:
+            units = -1 if event.delta > 0 else 1
+            self.page_canvas.yview_scroll(units * 3, "units")
+        return "break"
 
     def build_header(self, parent):
         header = tk.Frame(parent, bg=COLORS["bg"])
@@ -755,8 +1199,20 @@ class MarketingDashboard(tk.Tk):
         actions = tk.Frame(header, bg=COLORS["bg"])
         actions.grid(row=0, column=1, sticky="e")
 
-        self.run_button = self.make_button(actions, "Run Bot", self.start_bot, COLORS["accent"])
+        self.run_button = self.make_button(
+            actions,
+            "Run WhatsApp Bot",
+            self.start_bot,
+            COLORS["accent"],
+        )
         self.run_button.pack(side="left", padx=(0, 8))
+        self.linkedin_run_button = self.make_button(
+            actions,
+            "Run LinkedIn Bot",
+            self.launch_linkedin_browser,
+            "#0a66c2",
+        )
+        self.linkedin_run_button.pack(side="left", padx=(0, 8))
         self.pending_whatsapp_button = self.make_button(
             actions, "Send Pending WhatsApp",
             lambda: self.start_bot("pending-whatsapp", "pending WhatsApp"),
@@ -804,6 +1260,8 @@ class MarketingDashboard(tk.Tk):
             ("failed", "Failed ? Latest Run", COLORS["danger"]),
             ("emails", "Emails Sent ? Total", COLORS["accent_2"]),
             ("whatsapp", "WhatsApp Sent ? Total", COLORS["warning"]),
+            ("linkedin_drafts", "LinkedIn Drafts ? Total", "#60a5fa"),
+            ("linkedin", "LinkedIn Sent ? Total", "#0a66c2"),
         ]
         for index, (key, label, accent) in enumerate(cards):
             stats.grid_columnconfigure(index % 6, weight=1)
@@ -865,7 +1323,10 @@ class MarketingDashboard(tk.Tk):
         search.grid(row=1, column=0, sticky="ew", pady=(12, 10), ipady=8)
         search.insert(0, "")
 
-        columns = ("business", "website", "emails", "phones", "form", "email", "whatsapp", "status", "updated")
+        columns = (
+            "business", "website", "emails", "phones", "form", "email",
+            "whatsapp", "linkedin", "status", "updated",
+        )
         self.tree = ttk.Treeview(panel, columns=columns, show="headings", style="Dashboard.Treeview")
         headings = {
             "business": ("Business", 170),
@@ -875,6 +1336,7 @@ class MarketingDashboard(tk.Tk):
             "form": ("Form", 70),
             "email": ("Email", 78),
             "whatsapp": ("WhatsApp", 90),
+            "linkedin": ("LinkedIn", 90),
             "status": ("Status", 95),
             "updated": ("Updated", 120),
         }
@@ -886,7 +1348,12 @@ class MarketingDashboard(tk.Tk):
         self.tree.bind("<<TreeviewSelect>>", self.on_tree_select)
         scrollbar = ttk.Scrollbar(panel, orient="vertical", command=self.tree.yview)
         scrollbar.grid(row=2, column=1, sticky="ns")
-        self.tree.configure(yscrollcommand=scrollbar.set)
+        horizontal_scrollbar = ttk.Scrollbar(panel, orient="horizontal", command=self.tree.xview)
+        horizontal_scrollbar.grid(row=3, column=0, sticky="ew")
+        self.tree.configure(
+            yscrollcommand=scrollbar.set,
+            xscrollcommand=horizontal_scrollbar.set,
+        )
 
     def build_side_panel(self, parent):
         side = tk.Frame(parent, bg=COLORS["bg"])
@@ -906,6 +1373,10 @@ class MarketingDashboard(tk.Tk):
             "email": self.make_button(action_grid, "Mark Email Sent", self.mark_email_sent, COLORS["accent_2"]),
             "whatsapp": self.make_button(action_grid, "Open WhatsApp", self.open_whatsapp_review, COLORS["warning"]),
             "whatsapp_sent": self.make_button(action_grid, "Mark WhatsApp Sent", self.mark_whatsapp_sent, COLORS["accent"]),
+            "linkedin_details": self.make_button(action_grid, "LinkedIn Details", self.open_linkedin_campaign, "#0a66c2"),
+            "linkedin_open": self.make_button(action_grid, "Open LinkedIn", self.open_selected_linkedin, COLORS["panel_3"]),
+            "linkedin_copy": self.make_button(action_grid, "Copy LinkedIn Draft", self.copy_selected_linkedin_draft, COLORS["accent_2"]),
+            "linkedin_sent": self.make_button(action_grid, "Mark LinkedIn Sent", self.mark_linkedin_sent, COLORS["accent"]),
         }
         for index, button in enumerate(self.action_buttons.values()):
             button.grid(row=index // 2, column=index % 2, sticky="ew", padx=(0 if index % 2 == 0 else 8, 0), pady=(0, 8))
@@ -1042,13 +1513,14 @@ class MarketingDashboard(tk.Tk):
             """SELECT
                 o.*,
                 MAX(CASE WHEN e.event_type = ? THEN e.created_at END) AS email_sent_at,
-                MAX(CASE WHEN e.event_type = ? THEN e.created_at END) AS whatsapp_sent_at
+                MAX(CASE WHEN e.event_type = ? THEN e.created_at END) AS whatsapp_sent_at,
+                MAX(CASE WHEN e.event_type = ? THEN e.created_at END) AS linkedin_sent_at
             FROM outreach o
             LEFT JOIN outreach_events e ON e.business_key = o.business_key
             GROUP BY o.business_key
             ORDER BY COALESCE(o.updated_at, '') DESC"""
             ,
-            (EVENT_EMAIL_SENT, EVENT_WHATSAPP_SENT),
+            (EVENT_EMAIL_SENT, EVENT_WHATSAPP_SENT, EVENT_LINKEDIN_SENT),
         ).fetchall()
 
     def normalize_row(self, row):
@@ -1062,6 +1534,7 @@ class MarketingDashboard(tk.Tk):
         updated_at = row["updated_at"] or ""
         email_sent_at = row["email_sent_at"] or ""
         whatsapp_sent_at = row["whatsapp_sent_at"] or ""
+        linkedin_sent_at = row["linkedin_sent_at"] or ""
         return {
             "business_key": row["business_key"],
             "business_name": name,
@@ -1076,7 +1549,20 @@ class MarketingDashboard(tk.Tk):
             "updated_at": updated_at,
             "email_sent_at": email_sent_at,
             "whatsapp_sent_at": whatsapp_sent_at,
-            "haystack": " ".join([name, website, contact_page, " ".join(emails), " ".join(phones), status]).lower(),
+            "business_context": row["business_context"] or "",
+            "linkedin_profile_url": row["linkedin_profile_url"] or "",
+            "linkedin_contact_name": row["linkedin_contact_name"] or "",
+            "linkedin_contact_role": row["linkedin_contact_role"] or "",
+            "linkedin_business_type": row["linkedin_business_type"] or "",
+            "linkedin_draft": row["linkedin_draft"] or "",
+            "linkedin_updated_at": row["linkedin_updated_at"] or "",
+            "linkedin_sent_at": linkedin_sent_at,
+            "haystack": " ".join([
+                name, website, contact_page, " ".join(emails), " ".join(phones), status,
+                row["business_context"] or "", row["linkedin_profile_url"] or "",
+                row["linkedin_contact_name"] or "", row["linkedin_contact_role"] or "",
+                row["linkedin_business_type"] or "",
+            ]).lower(),
         }
 
     def fetch_stats(self, connection, rows):
@@ -1122,6 +1608,7 @@ class MarketingDashboard(tk.Tk):
             EVENT_FORM_PREFILLED: "Form filled",
             EVENT_EMAIL_SENT: "Email sent",
             EVENT_WHATSAPP_SENT: "WhatsApp sent",
+            EVENT_LINKEDIN_SENT: "LinkedIn sent",
         }
         lines = []
         for row in rows:
@@ -1136,6 +1623,7 @@ class MarketingDashboard(tk.Tk):
     def apply_filter(self):
         if not hasattr(self, "tree"):
             return
+        selected_keys = tuple(self.tree.selection())
         query = self.search_var.get().strip().lower()
         for item in self.tree.get_children():
             self.tree.delete(item)
@@ -1144,6 +1632,13 @@ class MarketingDashboard(tk.Tk):
                 continue
             email_state = row['channel_status'].get('email',{}).get('status') or ("Sent" if row["email_sent_at"] else ("Ready" if row["emails"] else "-"))
             whatsapp_state = row['channel_status'].get('whatsapp',{}).get('status') or ("Sent" if row["whatsapp_sent_at"] else ("Ready" if row["phones"] else "-"))
+            linkedin_state = row['channel_status'].get('linkedin',{}).get('status') or (
+                "Sent" if row["linkedin_sent_at"] else (
+                    "Draft" if row["linkedin_draft"] else (
+                        "Profile" if row["linkedin_profile_url"] else "-"
+                    )
+                )
+            )
             values = (
                 shorten(row["business_name"], 28),
                 shorten(row["website"], 38),
@@ -1152,10 +1647,16 @@ class MarketingDashboard(tk.Tk):
                 "Yes" if row["form_prefilled"] else "No",
                 email_state,
                 whatsapp_state,
+                linkedin_state,
                 row["status"],
                 self.format_time(row["updated_at"]),
             )
             self.tree.insert("", "end", iid=row["business_key"], values=values)
+        restored = next((key for key in selected_keys if self.tree.exists(key)), "")
+        if restored:
+            self.tree.selection_set(restored)
+            self.tree.focus(restored)
+            self.on_tree_select()
 
     def on_tree_select(self, _event=None):
         row = self.selected_row()
@@ -1169,6 +1670,7 @@ class MarketingDashboard(tk.Tk):
             f"Form: {'filled' if row['form_prefilled'] else 'not filled'}",
             f"Email: {'sent' if row['email_sent_at'] else 'not sent'}",
             f"WhatsApp: {'sent' if row['whatsapp_sent_at'] else 'not sent'}",
+            f"LinkedIn: {'sent' if row['linkedin_sent_at'] else ('draft ready' if row['linkedin_draft'] else 'not prepared')}",
         ]
         parts.extend(f"{channel.title()}: {outcome.get('status','pending')} ? {outcome.get('reason','')}"
                      for channel,outcome in row.get('channel_status',{}).items())
@@ -1201,6 +1703,242 @@ class MarketingDashboard(tk.Tk):
             if not proceed:
                 return
         self.record_manual_event(row, EVENT_WHATSAPP_SENT, "Marked WhatsApp as sent from dashboard")
+
+    def launch_linkedin_browser(self):
+        """Open LinkedIn manually in a new Chrome window using the bot profile."""
+        config = merge_config(DEFAULT_CONFIG, read_json(CONFIG_PATH))
+        linkedin_config = config.get("linkedin", {})
+        if not isinstance(linkedin_config, dict) or not to_bool(linkedin_config.get("enabled", True)):
+            messagebox.showwarning(
+                "LinkedIn disabled",
+                "Enable the LinkedIn campaign workflow in Settings first.",
+            )
+            return
+        search_keywords = str(
+            linkedin_config.get("search_keywords", "Co Founder and CEO")
+            or "Co Founder and CEO"
+        ).strip()
+        search_url = linkedin_people_search_url(search_keywords)
+        self.open_in_bot_chrome(
+            search_url,
+            f"LinkedIn people search opened: {search_keywords}",
+            config=config,
+        )
+
+    def open_in_bot_chrome(self, url, success_message, config=None):
+        """Open a URL in the persistent Chrome profile shared by the bot."""
+        config = config or merge_config(DEFAULT_CONFIG, read_json(CONFIG_PATH))
+        chrome_executable = find_chrome_executable(config)
+        if chrome_executable is None:
+            messagebox.showerror(
+                "Chrome not found",
+                "Chrome could not be located. Choose the Chrome executable in "
+                "Settings > Run, then try again.",
+            )
+            self.status_var.set("Chrome executable not found")
+            return False
+
+        profile_value = str(config.get("chrome_profile_dir", "chrome_profile") or "chrome_profile").strip()
+        profile_path = Path(profile_value).expanduser()
+        if not profile_path.is_absolute():
+            profile_path = APP_DIR / profile_path
+        profile_path.mkdir(parents=True, exist_ok=True)
+
+        command = [
+            str(chrome_executable),
+            f"--user-data-dir={profile_path.resolve()}",
+            "--profile-directory=Default",
+            "--new-window",
+            "--start-maximized",
+            "--no-first-run",
+            "--no-default-browser-check",
+            str(url),
+        ]
+        try:
+            subprocess.Popen(
+                command,
+                cwd=str(APP_DIR),
+                close_fds=True,
+                creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0,
+            )
+        except OSError as exc:
+            messagebox.showerror("Could not open LinkedIn", str(exc))
+            self.status_var.set("LinkedIn browser failed to open")
+            return False
+        self.status_var.set(success_message)
+        return True
+
+    def open_linkedin_campaign(self):
+        config = merge_config(DEFAULT_CONFIG, read_json(CONFIG_PATH))
+        linkedin_config = config.get("linkedin", {})
+        if not isinstance(linkedin_config, dict) or not to_bool(linkedin_config.get("enabled", True)):
+            messagebox.showwarning(
+                "LinkedIn disabled",
+                "Enable the LinkedIn campaign workflow in Settings first.",
+            )
+            return
+        row = self.selected_row()
+        if not row:
+            row = next((item for item in self.rows if not item["linkedin_sent_at"]), None)
+            if row and self.tree.exists(row["business_key"]):
+                self.tree.selection_set(row["business_key"])
+                self.tree.focus(row["business_key"])
+                self.tree.see(row["business_key"])
+                self.on_tree_select()
+        if not row:
+            messagebox.showinfo("LinkedIn campaign", "There are no available leads to prepare.")
+            return
+        LinkedInLeadDialog(self, row)
+
+    def generate_linkedin_draft(self, row, contact_name="", contact_role="", business_type=""):
+        config = merge_config(DEFAULT_CONFIG, read_json(CONFIG_PATH))
+        return build_linkedin_message(
+            row,
+            config,
+            contact_name=contact_name,
+            contact_role=contact_role,
+            business_type=business_type,
+        )
+
+    def save_linkedin_details(self, row, values):
+        profile_url = normalize_linkedin_url(values.get("profile_url", ""))
+        draft = str(values.get("draft", "")).strip()
+        config = merge_config(DEFAULT_CONFIG, read_json(CONFIG_PATH))
+        linkedin_config = config.get("linkedin", {})
+        if not isinstance(linkedin_config, dict):
+            linkedin_config = {}
+        max_chars = max(100, min(5000, int(linkedin_config.get("max_message_chars", 600) or 600)))
+        if len(draft) > max_chars:
+            raise ValueError(
+                f"The LinkedIn draft is {len(draft)} characters. The configured maximum is {max_chars}."
+            )
+
+        channel_status = dict(row.get("channel_status") or {})
+        if row.get("linkedin_sent_at"):
+            linkedin_status = "sent"
+        elif draft:
+            linkedin_status = "draft_ready"
+        elif profile_url:
+            linkedin_status = "profile_added"
+        else:
+            linkedin_status = "not_prepared"
+        channel_status["linkedin"] = {
+            "status": linkedin_status,
+            "reason": "Manual review required before sending",
+        }
+        updated_at = datetime.now().isoformat(timespec="seconds")
+        with closing(self.connect()) as connection:
+            connection.execute(
+                """UPDATE outreach SET
+                       linkedin_profile_url=?, linkedin_contact_name=?,
+                       linkedin_contact_role=?, linkedin_business_type=?,
+                       linkedin_draft=?, linkedin_updated_at=?, channel_status=?
+                   WHERE business_key=?""",
+                (
+                    profile_url,
+                    str(values.get("contact_name", "")).strip(),
+                    str(values.get("contact_role", "")).strip(),
+                    str(values.get("business_type", "")).strip(),
+                    draft,
+                    updated_at,
+                    json.dumps(channel_status),
+                    row["business_key"],
+                ),
+            )
+            connection.commit()
+        self.status_var.set("LinkedIn campaign details saved")
+        self.load_data()
+        if self.tree.exists(row["business_key"]):
+            self.tree.selection_set(row["business_key"])
+            self.tree.focus(row["business_key"])
+            self.on_tree_select()
+        return True
+
+    def open_selected_linkedin(self):
+        row = self.selected_row()
+        if not row:
+            messagebox.showinfo("Select a lead", "Select a lead first.")
+            return
+        profile_url = row.get("linkedin_profile_url", "")
+        if profile_url:
+            self.open_in_bot_chrome(
+                profile_url,
+                "LinkedIn profile opened for manual review",
+            )
+            return
+        query = f"{row['business_name']} CEO founder co-founder"
+        self.open_in_bot_chrome(
+            linkedin_people_search_url(query),
+            "LinkedIn people search opened; save the selected profile URL",
+        )
+
+    def copy_selected_linkedin_draft(self):
+        row = self.selected_row()
+        if not row:
+            messagebox.showinfo("Select a lead", "Select a lead first.")
+            return
+        draft = row.get("linkedin_draft", "")
+        if not draft:
+            messagebox.showinfo(
+                "No LinkedIn draft",
+                "Open LinkedIn Campaign and generate a draft first.",
+            )
+            return
+        self.copy_to_clipboard(draft, "LinkedIn draft copied")
+
+    def copy_to_clipboard(self, value, status_message="Copied"):
+        self.clipboard_clear()
+        self.clipboard_append(str(value))
+        self.update_idletasks()
+        self.status_var.set(status_message)
+
+    def mark_linkedin_sent(self):
+        row = self.selected_row()
+        if not row:
+            messagebox.showinfo("Select a lead", "Select a lead first.")
+            return
+        if row.get("linkedin_sent_at"):
+            messagebox.showinfo("Already marked", "This LinkedIn message is already marked as sent.")
+            return
+        if not row.get("linkedin_profile_url") or not row.get("linkedin_draft"):
+            messagebox.showinfo(
+                "LinkedIn campaign not ready",
+                "Save a LinkedIn profile URL and message draft before marking it as sent.",
+            )
+            return
+        if not messagebox.askyesno(
+            "Confirm LinkedIn message",
+            "Only continue after you have manually sent this message on LinkedIn. Mark it as sent?",
+        ):
+            return
+
+        channel_status = dict(row.get("channel_status") or {})
+        channel_status["linkedin"] = {
+            "status": "sent",
+            "reason": "Confirmed manually in the dashboard",
+        }
+        with closing(self.connect()) as connection:
+            created = record_event(
+                connection,
+                EVENT_LINKEDIN_SENT,
+                row["business_key"],
+                {"name": row["business_name"], "website": row["website"]},
+                details="Marked LinkedIn as sent from dashboard",
+                recipient=row["linkedin_profile_url"],
+            )
+            connection.execute(
+                """UPDATE outreach
+                   SET channel_status=?, linkedin_updated_at=?
+                   WHERE business_key=?""",
+                (
+                    json.dumps(channel_status),
+                    datetime.now().isoformat(timespec="seconds"),
+                    row["business_key"],
+                ),
+            )
+            connection.commit()
+        self.status_var.set("LinkedIn message marked as sent" if created else "Already marked")
+        self.load_data()
 
     def record_manual_event(self, row, event_type, details):
         with closing(self.connect()) as connection:
