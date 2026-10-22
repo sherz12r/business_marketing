@@ -95,12 +95,22 @@ IMPORTANT:
   such as website work, integrations, custom software, accounting, POS, CRM,
   inventory, e-commerce, booking, automation, maintenance, SEO, or marketing.
 - Do not write a generic list or imply that every service is suitable.
-- For an ordinary business, propose one dedicated software concept tailored to
-  its likely industry and briefly explain how it could streamline operations.
-  Mention only two or three relevant capabilities, without assuming that the
-  business currently lacks them or claiming guaranteed results.
-- End by asking whether they are interested in website improvements, new or
-  updated dedicated business software, or both.
+- For an ordinary business, propose one cohesive solution tailored to its
+  likely industry. Explain how the components work together in practical,
+  customer-friendly language instead of merely listing services. Mention three
+  to five relevant capabilities and the workflow or business value they can
+  support, without assuming that the business currently lacks them or claiming
+  guaranteed results.
+- For a restaurant, cafe, or catering business, offer an integrated solution
+  such as a POS connected to the website, online menu and direct customer
+  ordering, kitchen/order workflow, inventory control, and sales reporting.
+  Explain that website orders can flow into the same operational system.
+- For a general business without a clearer industry-specific match, offer an
+  invoicing and accounting solution covering quotations, invoices, expenses,
+  customer balances, profit-and-loss reporting, and management reports.
+- Keep the proposal focused and readable, normally around 120 to 180 words.
+- End by asking whether they are interested in website improvements, a tailored
+  business-management solution, or both.
 - If the target is itself a software, IT, web, advertising, or marketing
   provider, treat it as a potential partner and propose collaboration rather
   than selling website development or ordinary client services.
@@ -1748,7 +1758,7 @@ class MarketingDashboard(tk.Tk):
             str(chrome_executable),
             f"--user-data-dir={profile_path.resolve()}",
             "--profile-directory=Default",
-            "--new-window",
+            "--new-tab",
             "--start-maximized",
             "--no-first-run",
             "--no-default-browser-check",
@@ -1970,7 +1980,10 @@ class MarketingDashboard(tk.Tk):
         if not url:
             messagebox.showinfo("Not ready", "This lead needs a phone number and proposal text first.")
             return
-        webbrowser.open(url)
+        self.open_in_bot_chrome(
+            url,
+            "WhatsApp opened in the shared Chrome window",
+        )
 
     def whatsapp_url(self, row):
         phone = next((item for item in row["phones"] if re.sub(r"\D", "", item)), "")

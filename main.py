@@ -96,12 +96,22 @@ IMPORTANT:
   such as website work, integrations, custom software, accounting, POS, CRM,
   inventory, e-commerce, booking, automation, maintenance, SEO, or marketing.
 - Do not write a generic list or imply that every service is suitable.
-- For an ordinary business, propose one dedicated software concept tailored to
-  its likely industry and briefly explain how it could streamline operations.
-  Mention only two or three relevant capabilities, without assuming that the
-  business currently lacks them or claiming guaranteed results.
-- End by asking whether they are interested in website improvements, new or
-  updated dedicated business software, or both.
+- For an ordinary business, propose one cohesive solution tailored to its
+  likely industry. Explain how the components work together in practical,
+  customer-friendly language instead of merely listing services. Mention three
+  to five relevant capabilities and the workflow or business value they can
+  support, without assuming that the business currently lacks them or claiming
+  guaranteed results.
+- For a restaurant, cafe, or catering business, offer an integrated solution
+  such as a POS connected to the website, online menu and direct customer
+  ordering, kitchen/order workflow, inventory control, and sales reporting.
+  Explain that website orders can flow into the same operational system.
+- For a general business without a clearer industry-specific match, offer an
+  invoicing and accounting solution covering quotations, invoices, expenses,
+  customer balances, profit-and-loss reporting, and management reports.
+- Keep the proposal focused and readable, normally around 120 to 180 words.
+- End by asking whether they are interested in website improvements, a tailored
+  business-management solution, or both.
 - If the target is itself a software, IT, web, advertising, or marketing
   provider, treat it as a potential partner and propose collaboration rather
   than selling website development or ordinary client services.
@@ -127,6 +137,8 @@ PROPOSAL_SERVICES = [
     "Business Email Setup",
     "Accounting Software",
     "POS Solutions",
+    "Restaurant POS and Website Ordering Integration",
+    "Quotations, Invoicing, Expense, and Profit/Loss Reporting",
     "CRM and Customer Management Solutions",
     "Inventory Management Solutions",
     "E-Invoicing Software",
@@ -2466,6 +2478,22 @@ class Automation(GoogleResultsMixin, OutreachChannelsMixin):
                 "digital marketing when appropriate. Keep the result short, focused, and readable."
             )
 
+        if not partnership_outreach and "website orders can flow into the same operational system" not in prompt.lower():
+            prompt += (
+                "\n\nINDUSTRY SOLUTION REQUIREMENT:\n"
+                "Recommend one cohesive solution for the likely business type and explain, "
+                "in practical terms, how its components can work together. Do not give only "
+                "a generic service list. For a restaurant, cafe, or catering business, propose "
+                "an integrated POS and website solution with an online menu, direct customer "
+                "ordering, kitchen/order workflow, inventory control, and sales reporting; "
+                "explain that website orders can flow into the same operational system. For "
+                "a general business without a clearer industry match, propose an invoicing "
+                "and accounting solution covering quotations, invoices, expenses, customer "
+                "balances, profit-and-loss reporting, and management reports. For other "
+                "industries, provide an equally concrete, relevant solution and explain its "
+                "operational value. Keep the proposal around 120 to 180 words."
+            )
+
         lower_prompt = prompt.lower()
         final_rules = []
         if "do not include sender contact details" not in lower_prompt:
@@ -2595,7 +2623,9 @@ class Automation(GoogleResultsMixin, OutreachChannelsMixin):
             (("hotel", "resort", "hospitality"),
              "a tailored hospitality platform for reservations, guest requests, and operational reporting"),
             (("restaurant", "cafe", "cafeteria", "catering"),
-             "a tailored restaurant platform for orders, reservations, inventory, and customer management"),
+             "an integrated restaurant solution that connects a POS with website ordering, "
+             "menu management, kitchen and order tracking, inventory control, and sales reports, "
+             "so online and in-store orders can be handled in one workflow"),
             (("salon", "spa", "beauty", "barber"),
              "a dedicated salon-management platform for appointments, staff schedules, customer records, and reminders"),
             (("clinic", "medical", "dental", "health"),
@@ -2619,8 +2649,8 @@ class Automation(GoogleResultsMixin, OutreachChannelsMixin):
             if any(keyword in context for keyword in keywords):
                 return suggestion
         return (
-            "a dedicated business-operations platform for customer management, "
-            "workflow tracking, and management reporting"
+            "an integrated invoicing and accounting system for quotations, invoices, "
+            "expenses, customer balances, profit-and-loss reporting, and management reports"
         )
 
     @staticmethod
