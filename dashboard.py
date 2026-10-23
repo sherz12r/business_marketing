@@ -20,6 +20,7 @@ import tkinter as tk
 from app_paths import get_app_dir
 from campaign import campaign_stats
 from process_utils import process_running
+from outreach_text import clean_outreach_message
 from progress_tracker import (
     EVENT_EMAIL_SENT,
     EVENT_FORM_PREFILLED,
@@ -1463,7 +1464,7 @@ class MarketingDashboard(tk.Tk):
         return "Contact details:\n" + "\n".join(lines)
 
     def channel_message(self, message, section):
-        text = str(message or "").strip()
+        text = clean_outreach_message(message)
         if not text:
             return ""
         config = merge_config(DEFAULT_CONFIG, read_json(CONFIG_PATH))
@@ -1539,7 +1540,7 @@ class MarketingDashboard(tk.Tk):
         website = row["website"] or ""
         name = row["business_name"] or domain_from_url(website)
         contact_page = row["contact_page"] or ""
-        proposal = row["proposal"] or ""
+        proposal = clean_outreach_message(row["proposal"])
         status = row["status"] or "draft_ready"
         updated_at = row["updated_at"] or ""
         email_sent_at = row["email_sent_at"] or ""

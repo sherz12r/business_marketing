@@ -28,6 +28,7 @@ from playwright.sync_api import sync_playwright
 from dotenv import load_dotenv
 from google_results import GoogleResultsMixin
 from outreach_channels import OutreachChannelsMixin
+from outreach_text import clean_outreach_message
 from app_paths import get_app_dir
 from campaign import load_location_catalog, seed_target_areas
 from progress_tracker import (
@@ -1944,7 +1945,15 @@ class Automation(GoogleResultsMixin, OutreachChannelsMixin):
             try:
                 count = responses.count()
                 if count:
-                    text = responses.nth(count - 1).inner_text(timeout=5000).strip()
+                    response = responses.nth(count - 1)
+                    content = response.locator(
+                        ".markdown.prose, .markdown, [data-message-content]"
+                    )
+                    if content.count():
+                        raw_text = content.last.inner_text(timeout=5000)
+                    else:
+                        raw_text = response.inner_text(timeout=5000)
+                    text = clean_outreach_message(raw_text)
                     if text and text == last_text:
                         stable_reads += 1
                     else:
@@ -1969,7 +1978,9 @@ class Automation(GoogleResultsMixin, OutreachChannelsMixin):
         copy_button.scroll_into_view_if_needed()
         copy_button.click()
         page.wait_for_timeout(1000)
-        return page.evaluate("navigator.clipboard.readText()")
+        return clean_outreach_message(
+            page.evaluate("navigator.clipboard.readText()")
+        )
 
     def ask_ai(self, content, domain, filename, Image=False):
 
@@ -2010,8 +2021,7 @@ class Automation(GoogleResultsMixin, OutreachChannelsMixin):
 
                 response = response.output_text
 
-                self._log("writing ai response")
-                self._log(response)
+                self._log("Outreach draft received.")
 
                 # ----------------------------------------------------
                 # Make sure response exists
@@ -2249,8 +2259,7 @@ class Automation(GoogleResultsMixin, OutreachChannelsMixin):
                 previous_count
             )
 
-            self._log("writing ai response")
-            self._log(response)
+            self._log("Outreach draft received.")
 
             # Make sure response exists
             if response is None:
@@ -2526,6 +2535,9 @@ class Automation(GoogleResultsMixin, OutreachChannelsMixin):
                 domain=company_name,
                 filename="proposal"
             )
+            message = clean_outreach_message(message)
+            if not message:
+                raise ValueError("Generated outreach message contained no sendable text")
             if audit_findings and self.audit_message_exposes_details(message):
                 self._log(
                     "AI draft exposed technical audit details; using the customer-friendly issue summary."
@@ -2759,10 +2771,10 @@ class Automation(GoogleResultsMixin, OutreachChannelsMixin):
         return "Contact details:\n" + "\n".join(lines)
 
     def channel_message(self, result, section):
-        message = (
+        message = clean_outreach_message(
             result.get("proposal", "")
             or ""
-        ).strip()
+        )
 
         if not message:
             return ""
@@ -3680,6 +3692,7 @@ class Automation(GoogleResultsMixin, OutreachChannelsMixin):
             return True
 
     def save_outreach(self, business_key, result):
+        result["proposal"] = clean_outreach_message(result.get("proposal", ""))
         self.db.execute(
             '''INSERT INTO outreach (
                 business_key, business_name, website, contact_page, emails,

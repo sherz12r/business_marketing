@@ -20,6 +20,7 @@ from dotenv import load_dotenv
 from app_paths import get_app_dir
 from campaign import campaign_stats, load_location_catalog, seed_target_areas
 from process_utils import process_running
+from outreach_text import clean_outreach_message
 from progress_tracker import (
     EVENT_EMAIL_SENT,
     EVENT_FORM_PREFILLED,
@@ -193,7 +194,7 @@ def dashboard_data():
             "emails": parse_list(row["emails"]),
             "phones": parse_list(row["phones"]),
             "whatsapp_phones": parse_list(row["whatsapp_phones"]),
-            "proposal": row["proposal"] or "",
+            "proposal": clean_outreach_message(row["proposal"]),
             "status": row["status"] or "draft_ready",
             "channel_status": json.loads(row["channel_status"] or "{}"),
             "form_prefilled": bool(row["form_prefilled"]),
