@@ -157,6 +157,7 @@ DEFAULT_CONFIG = {
         "max_areas_per_run": 1,
         "never_repeat_contacted": True,
     },
+    "message_focus": "website_audit_and_software",
     "proposal_prompt": DEFAULT_PROPOSAL_PROMPT,
     "ignore_urls": [],
     "company_name": "",
@@ -247,6 +248,16 @@ SETTINGS_SECTIONS = [
     (
         "AI Prompt",
         [
+            {
+                "path": ("message_focus",),
+                "label": "Message Content",
+                "type": "select",
+                "options": [
+                    ("website_audit_and_software", "Website audit + software proposal"),
+                    ("website_audit_only", "Website audit / website services only"),
+                    ("software_proposal_only", "Software proposal only"),
+                ],
+            },
             {"path": ("proposal_prompt",), "label": "Proposal Prompt", "type": "textarea", "height": 24},
             {"path": ("use_browser_ai",), "label": "Use Browser AI When API Key Is Missing", "type": "bool"},
         ],
@@ -714,6 +725,17 @@ class SettingsDialog(tk.Toplevel):
                 )
                 text.grid(row=row, column=1, sticky="ew", pady=(8, 8), ipady=4)
                 self.text_widgets[path_key] = (field, text)
+            elif field_type == "select":
+                variable = tk.StringVar()
+                widget = ttk.Combobox(
+                    parent,
+                    textvariable=variable,
+                    state="readonly",
+                    values=[label for _value, label in field.get("options", [])],
+                    font=("Segoe UI", 10),
+                )
+                widget.grid(row=row, column=1, sticky="ew", pady=(8, 8), ipady=4)
+                self.variables[path_key] = (field, variable)
             else:
                 variable = tk.StringVar()
                 field_frame = tk.Frame(parent, bg=COLORS["panel"])
@@ -774,6 +796,9 @@ class SettingsDialog(tk.Toplevel):
             value = get_config_value(self.config_data, field["path"], "")
             if field["type"] == "bool":
                 variable.set(to_bool(value))
+            elif field["type"] == "select":
+                labels = dict(field.get("options", []))
+                variable.set(labels.get(str(value), next(iter(labels.values()), "")))
             else:
                 variable.set("" if value is None else str(value))
         for path_key, (field, widget) in self.text_widgets.items():
@@ -825,6 +850,14 @@ class SettingsDialog(tk.Toplevel):
                     raise ValueError(f"{field['label']} must be at least {field['min']}.")
                 if "max" in field and value > field["max"]:
                     raise ValueError(f"{field['label']} must be {field['max']} or lower.")
+            elif field_type == "select":
+                choices = {
+                    label: option_value
+                    for option_value, label in field.get("options", [])
+                }
+                if raw_value not in choices:
+                    raise ValueError(f"Choose a valid value for {field['label']}.")
+                value = choices[raw_value]
             else:
                 value = str(raw_value).strip()
 

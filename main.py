@@ -149,6 +149,16 @@ PROPOSAL_SERVICES = [
 ]
 
 
+MESSAGE_FOCUS_COMBINED = "website_audit_and_software"
+MESSAGE_FOCUS_WEBSITE = "website_audit_only"
+MESSAGE_FOCUS_SOFTWARE = "software_proposal_only"
+MESSAGE_FOCUS_OPTIONS = {
+    MESSAGE_FOCUS_COMBINED,
+    MESSAGE_FOCUS_WEBSITE,
+    MESSAGE_FOCUS_SOFTWARE,
+}
+
+
 PARTNER_BUSINESS_PATTERNS = (
     r"\bsoftware (?:company|development|developer|solutions?|services?)\b",
     r"\bcustom software\b",
@@ -2352,6 +2362,20 @@ class Automation(GoogleResultsMixin, OutreachChannelsMixin):
         )).lower()
         return any(re.search(pattern, context) for pattern in PARTNER_BUSINESS_PATTERNS)
 
+    def message_focus(self):
+        """Return the configured outreach content focus, with a safe legacy default."""
+        value = str(
+            self.config.get("message_focus", MESSAGE_FOCUS_COMBINED) or ""
+        ).strip().lower()
+        aliases = {
+            "combined": MESSAGE_FOCUS_COMBINED,
+            "website": MESSAGE_FOCUS_WEBSITE,
+            "audit": MESSAGE_FOCUS_WEBSITE,
+            "software": MESSAGE_FOCUS_SOFTWARE,
+        }
+        value = aliases.get(value, value)
+        return value if value in MESSAGE_FOCUS_OPTIONS else MESSAGE_FOCUS_COMBINED
+
     def generate_website_proposal(self, website):
         """
         Generate industry-aware outreach based on the business information and
@@ -2367,11 +2391,16 @@ class Automation(GoogleResultsMixin, OutreachChannelsMixin):
         )
         business_context = website.get("profile_text") or self.search_query
         partnership_outreach = self.is_similar_service_business(website)
+        message_focus = self.message_focus()
+        include_website = message_focus != MESSAGE_FOCUS_SOFTWARE
+        include_software = message_focus != MESSAGE_FOCUS_WEBSITE
         audit_findings = [
             str(finding).strip()
             for finding in website.get("audit_findings", [])
             if str(finding).strip()
         ]
+        if not include_website:
+            audit_findings = []
         our_company = self.config.get("company_name", "our web development company")
         prompt_template = str(
             self.config.get("proposal_prompt", "")
@@ -2410,7 +2439,7 @@ class Automation(GoogleResultsMixin, OutreachChannelsMixin):
                 "and combining complementary expertise. Do not assume which arrangement "
                 "they need; invite a brief discussion about possible collaboration."
             )
-        elif not has_website:
+        elif not has_website and include_website and include_software:
             prompt += (
                 "\n\nThis business has no website listed. Clearly and politely propose "
                 "creating a new professional, modern website to upgrade their online "
@@ -2420,10 +2449,28 @@ class Automation(GoogleResultsMixin, OutreachChannelsMixin):
                 "or both. Do not "
                 "imply that they already have a website or currently lack suitable software."
             )
-        else:
+        elif not has_website and include_website:
+            prompt += (
+                "\n\nWEBSITE-ONLY OUTREACH REQUIREMENT:\n"
+                "This business has no website listed. Politely propose creating a new, "
+                "professional website to strengthen its online presence. Focus only on "
+                "website creation and relevant website features. Do not mention, propose, "
+                "or ask about custom software, POS, CRM, accounting, inventory, or another "
+                "business-management system."
+            )
+        elif not has_website:
+            prompt += (
+                "\n\nSOFTWARE-ONLY OUTREACH REQUIREMENT:\n"
+                "Write only a tailored software proposal for this business type. Propose "
+                "one dedicated software concept and briefly explain two or three useful "
+                "capabilities and their practical value. Do not mention whether the business "
+                "has a website, website creation, website audits, SEO, website issues, or "
+                "website improvements. End by inviting a discussion about the software."
+            )
+        elif include_website:
             prompt += f"\n\nWEBSITE REVIEW:\nWebsite checked: {website_url or 'Website URL listed on Google'}"
             if audit_findings:
-                prompt += (
+                website_requirement = (
                     "\nConfirmed homepage observations (use these as the only source for "
                     "the website issues mentioned to the customer):\n"
                     + "\n".join(f"- {finding}" for finding in audit_findings)
@@ -2440,23 +2487,39 @@ class Automation(GoogleResultsMixin, OutreachChannelsMixin):
                     "our team can fix these website issues and invite them to discuss the work. "
                     "Do not invent additional issue categories. "
                     "Do not claim the site is hacked, vulnerable, unsafe, penalized, or "
-                    "non-responsive unless the confirmed observations explicitly prove it. "
-                    "After the website summary, propose one dedicated software concept "
+                    "non-responsive unless the confirmed observations explicitly prove it."
+                )
+            else:
+                website_requirement = (
+                    "\nNo specific issue was safely confirmed by the automated homepage "
+                    "check. Do not invent an SEO, responsive-design, performance, or security "
+                    "problem. Offer a deeper review and explain that we can fix any confirmed "
+                    "website issues."
+                )
+            if include_software:
+                website_requirement += (
+                    " After the website summary, propose one dedicated software concept "
                     "specific to this business type that could streamline its operations. "
                     "Mention only two or three relevant capabilities. End by asking whether "
                     "they would be interested in website improvements, new or updated "
                     "dedicated software, or both."
                 )
             else:
-                prompt += (
-                    "\nNo specific issue was safely confirmed by the automated homepage "
-                    "check. Do not invent an SEO, responsive-design, performance, or security "
-                    "problem. Offer a deeper review and explain that we can fix any confirmed "
-                    "website issues. Then propose one dedicated software concept specific to "
-                    "this business type that could streamline its operations, and ask whether "
-                    "they are interested in website improvements, new or updated dedicated "
-                    "software, or both."
+                website_requirement += (
+                    " Keep the entire message focused on the website review and website "
+                    "improvements. Do not mention, propose, or ask about custom software, "
+                    "POS, CRM, accounting, inventory, or any business-management system."
                 )
+            prompt += website_requirement
+        else:
+            prompt += (
+                "\n\nSOFTWARE-ONLY OUTREACH REQUIREMENT:\n"
+                "Write only a tailored software proposal for this business type. Propose "
+                "one dedicated software concept and briefly explain two or three useful "
+                "capabilities and their practical value. Do not mention the website, the "
+                "website review, audit findings, SEO, website issues, or website improvements. "
+                "End by inviting a discussion about the proposed software."
+            )
 
         if partnership_outreach:
             prompt += (
@@ -2464,30 +2527,49 @@ class Automation(GoogleResultsMixin, OutreachChannelsMixin):
                 "Do not list or sell our normal services and do not treat this company "
                 "as an ordinary sales prospect."
             )
-        elif has_website:
+        elif include_website and include_software:
+            if has_website:
+                prompt += (
+                    "\n\nKeep the message focused on the specific, customer-friendly website "
+                    "issues supported by the review and one genuinely relevant dedicated-software "
+                    "idea. Do not replace the confirmed issues with generic SEO language, replace "
+                    "the tailored idea with a generic service list, or include a technical tutorial. "
+                    "Arrange the message professionally: website issues, tailored software "
+                    "opportunity, then a concise question about website improvements, new or "
+                    "updated software, or both."
+                )
+            else:
+                prompt += (
+                    "\n\nTAILORING REQUIREMENT:\n"
+                    "Identify the business type from the business name and search/category "
+                    "context. Keep the message focused on a suitable new website and one "
+                    "genuinely relevant software idea for that business type."
+                )
+        elif include_website:
+            if has_website:
+                prompt += (
+                    "\n\nKeep the message focused only on the specific, customer-friendly "
+                    "website issues supported by the review. Do not include a software proposal "
+                    "or a generic service list."
+                )
+            else:
+                prompt += (
+                    "\n\nKeep the message focused only on a suitable new website for this "
+                    "business type. Do not include a software proposal or generic service list."
+                )
+        elif include_software:
             prompt += (
-                "\n\nKeep the message focused on the specific, customer-friendly website "
-                "issues supported by the review and one genuinely relevant dedicated-software "
-                "idea. Do not replace the confirmed issues with generic SEO language, replace "
-                "the tailored idea with a generic service list, or include a technical tutorial. "
-                "Arrange the message professionally: website issues, tailored software "
-                "opportunity, then a concise question about website improvements, new or "
-                "updated software, or both."
-            )
-        else:
-            prompt += (
-                "\n\nTAILORING REQUIREMENT:\n"
-                "Identify the business type from the business name and search/category context. "
-                "Write a specific message for that type of business, not a generic marketing message. "
-                "Select only the services from the provided service list that are realistically useful "
-                "to this business, and briefly connect each service to a likely practical use without "
-                "claiming the business currently has a problem. It may offer website updates or "
-                "modifications, a new website when none is listed, custom software, accounting, POS, "
-                "CRM, inventory, booking, e-commerce, integrations, automation, maintenance, SEO, or "
-                "digital marketing when appropriate. Keep the result short, focused, and readable."
+                "\n\nKeep the message focused only on one genuinely relevant, dedicated "
+                "software idea for this business type. Do not refer to its website or the "
+                "automated website review."
             )
 
-        if not partnership_outreach and "website orders can flow into the same operational system" not in prompt.lower():
+        if (
+            not partnership_outreach
+            and include_software
+            and include_website
+            and "website orders can flow into the same operational system" not in prompt.lower()
+        ):
             prompt += (
                 "\n\nINDUSTRY SOLUTION REQUIREMENT:\n"
                 "Recommend one cohesive solution for the likely business type and explain, "
@@ -2501,6 +2583,19 @@ class Automation(GoogleResultsMixin, OutreachChannelsMixin):
                 "balances, profit-and-loss reporting, and management reports. For other "
                 "industries, provide an equally concrete, relevant solution and explain its "
                 "operational value. Keep the proposal around 120 to 180 words."
+            )
+        elif not partnership_outreach and include_software:
+            prompt += (
+                "\n\nINDUSTRY SOFTWARE REQUIREMENT:\n"
+                "Recommend one cohesive software solution for the likely business type and "
+                "explain its practical operational value. Do not give a generic service list. "
+                "For a restaurant, cafe, or catering business, propose an integrated POS and "
+                "ordering solution with menu management, kitchen workflow, inventory control, "
+                "and sales reporting. For a general business without a clearer industry match, "
+                "propose invoicing and accounting software covering quotations, invoices, "
+                "expenses, customer balances, profit-and-loss reporting, and management reports. "
+                "For other industries, provide an equally concrete, relevant software concept. "
+                "Do not mention website services. Keep the proposal around 120 to 180 words."
             )
 
         lower_prompt = prompt.lower()
@@ -2523,6 +2618,26 @@ class Automation(GoogleResultsMixin, OutreachChannelsMixin):
         if final_rules:
             prompt = f"{prompt}\n\nFINAL RULES:\n" + "\n".join(final_rules)
 
+        if not partnership_outreach:
+            focus_rules = {
+                MESSAGE_FOCUS_COMBINED: (
+                    "Include both the relevant website message and one tailored software "
+                    "proposal, then ask whether they are interested in either or both."
+                ),
+                MESSAGE_FOCUS_WEBSITE: (
+                    "Include only the website audit, website improvement, or new-website "
+                    "message. Do not include any software proposal."
+                ),
+                MESSAGE_FOCUS_SOFTWARE: (
+                    "Include only a tailored software proposal. Do not mention websites, "
+                    "website audits, SEO, or website services."
+                ),
+            }
+            prompt += (
+                "\n\nMESSAGE FOCUS (HIGHEST PRIORITY):\n"
+                + focus_rules[message_focus]
+            )
+
         if not os.environ.get("OPENAI_API_KEY") and not bool(
             self.config.get("use_browser_ai", False)
         ):
@@ -2538,7 +2653,15 @@ class Automation(GoogleResultsMixin, OutreachChannelsMixin):
             message = clean_outreach_message(message)
             if not message:
                 raise ValueError("Generated outreach message contained no sendable text")
-            if audit_findings and self.audit_message_exposes_details(message):
+            if (
+                not partnership_outreach
+                and not self.message_matches_focus(message, message_focus)
+            ):
+                self._log(
+                    "AI draft did not follow the selected message content; using the matching local message."
+                )
+                return self.fallback_outreach_message(website)
+            if include_website and audit_findings and self.audit_message_exposes_details(message):
                 self._log(
                     "AI draft exposed technical audit details; using the customer-friendly issue summary."
                 )
@@ -2567,6 +2690,20 @@ class Automation(GoogleResultsMixin, OutreachChannelsMixin):
                 "to understand each other's capabilities and discuss where collaboration "
                 "could create value for both businesses."
             )
+        message_focus = self.message_focus()
+        software_idea = self.business_software_suggestion(
+            website,
+            include_website=message_focus != MESSAGE_FOCUS_SOFTWARE,
+        )
+        if message_focus == MESSAGE_FOCUS_SOFTWARE:
+            return (
+                f"{greeting}\n\n"
+                f"We can develop {software_idea} to help streamline your day-to-day "
+                "operations. The solution can be tailored around your workflow and the "
+                "features most useful to your team.\n\n"
+                "Would you be interested in a brief discussion about your requirements "
+                "and a suitable software proposal?"
+            )
         has_website = bool(
             website.get("url")
             or website.get("has_website")
@@ -2574,7 +2711,6 @@ class Automation(GoogleResultsMixin, OutreachChannelsMixin):
         )
         if has_website:
             website_url = str(website.get("url", "") or "").strip()
-            software_idea = self.business_software_suggestion(website)
             findings = [
                 str(finding).strip()
                 for finding in website.get("audit_findings", [])
@@ -2589,55 +2725,71 @@ class Automation(GoogleResultsMixin, OutreachChannelsMixin):
                 else:
                     issues_text = ", ".join(customer_issues[:-1]) + f", and {customer_issues[-1]}"
                     review_text = "we identified several issues, including " + issues_text
-                return (
+                website_message = (
                     f"{greeting}\n\n"
                     f"During a brief review of {website_url or 'your website'}, {review_text}.\n\n"
                     "Our team can fix these website issues and improve the site's clarity, "
-                    "usability, and online presence.\n\n"
-                    f"We can also develop {software_idea} to help streamline your day-to-day "
-                    "operations. Would you be interested in discussing website improvements, "
-                    "new or updated dedicated software, or both?"
+                    "usability, and online presence."
                 )
-            return (
-                f"{greeting}\n\n"
-                f"We took a brief look at {website_url or 'your website'}. Our automated "
-                "homepage check did not confirm a specific issue that would be fair to "
-                "claim without a deeper review. We can perform a closer website review "
-                "and update any confirmed SEO, mobile-usability, performance, or security-"
-                "baseline issues.\n\n"
+            else:
+                website_message = (
+                    f"{greeting}\n\n"
+                    f"We took a brief look at {website_url or 'your website'}. Our automated "
+                    "homepage check did not confirm a specific issue that would be fair to "
+                    "claim without a deeper review. We can perform a closer website review "
+                    "and update any confirmed SEO, mobile-usability, performance, or security-"
+                    "baseline issues."
+                )
+            if message_focus == MESSAGE_FOCUS_WEBSITE:
+                return website_message + (
+                    "\n\nWould you be interested in discussing a closer website review and "
+                    "any suitable improvements?"
+                )
+            return website_message + (
+                "\n\n"
                 f"We can also develop {software_idea} to help streamline your day-to-day "
                 "operations. Would you be interested in discussing website improvements, "
                 "new or updated dedicated software, or both?"
             )
 
-        software_idea = self.business_software_suggestion(website)
-        return (
+        website_message = (
             f"{greeting}\n\n"
             "Your Google Business Profile does not currently show a website. We can "
             "create a professional, mobile-friendly website to upgrade your online presence, "
             "with clear service information, contact details, location, and online "
-            "booking or enquiry features where useful.\n\n"
+            "booking or enquiry features where useful."
+        )
+        if message_focus == MESSAGE_FOCUS_WEBSITE:
+            return website_message + "\n\nWould you be interested in discussing a new website?"
+        return website_message + (
+            "\n\n"
             f"We can also develop {software_idea} to help streamline your day-to-day "
             "operations. Would you be interested in discussing a new website, new or "
             "updated dedicated software, or both?"
         )
 
     @staticmethod
-    def business_software_suggestion(website):
+    def business_software_suggestion(website, include_website=True):
         """Return one concise software concept tailored to the likely business type."""
         context = " ".join(
             str(website.get(key, "") or "")
             for key in ("name", "profile_text", "business_context", "search_query")
         ).lower()
+        restaurant_suggestion = (
+            "an integrated restaurant solution that connects a POS with website ordering, "
+            "menu management, kitchen and order tracking, inventory control, and sales reports, "
+            "so online and in-store orders can be handled in one workflow"
+            if include_website
+            else "an integrated restaurant system for POS, digital menu and ordering, "
+            "kitchen workflow, inventory control, and sales reporting"
+        )
         suggestions = (
             (("travel", "tour", "holiday", "visa"),
              "a dedicated travel-operations platform for enquiries, bookings, itineraries, and customer follow-up"),
             (("hotel", "resort", "hospitality"),
              "a tailored hospitality platform for reservations, guest requests, and operational reporting"),
             (("restaurant", "cafe", "cafeteria", "catering"),
-             "an integrated restaurant solution that connects a POS with website ordering, "
-             "menu management, kitchen and order tracking, inventory control, and sales reports, "
-             "so online and in-store orders can be handled in one workflow"),
+             restaurant_suggestion),
             (("salon", "spa", "beauty", "barber"),
              "a dedicated salon-management platform for appointments, staff schedules, customer records, and reminders"),
             (("clinic", "medical", "dental", "health"),
@@ -2664,6 +2816,23 @@ class Automation(GoogleResultsMixin, OutreachChannelsMixin):
             "an integrated invoicing and accounting system for quotations, invoices, "
             "expenses, customer balances, profit-and-loss reporting, and management reports"
         )
+
+    @staticmethod
+    def message_matches_focus(message, message_focus):
+        """Reject an AI draft that includes content excluded by the saved focus."""
+        text = str(message or "").lower()
+        if message_focus == MESSAGE_FOCUS_SOFTWARE:
+            return not re.search(
+                r"\b(?:website|web site|homepage|seo|website audit|web development)\b",
+                text,
+            )
+        if message_focus == MESSAGE_FOCUS_WEBSITE:
+            return not re.search(
+                r"\b(?:software|pos|crm|inventory system|accounting system|"
+                r"business-management (?:system|platform)|business software)\b",
+                text,
+            )
+        return True
 
     @staticmethod
     def audit_improvement_areas(findings):
