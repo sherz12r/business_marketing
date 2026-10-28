@@ -82,6 +82,9 @@ IMPORTANT:
 - Do not pretend that we know the company's specific problems.
 - Do not make false claims about their current website.
 - Do not say that we noticed problems unless they are explicitly provided.
+- When a website URL and confirmed observations are provided, explicitly mention
+  the URL in the customer-facing message and say that we visited the website
+  before introducing only those confirmed issues.
 - Keep it relatively short.
 - Sound human, professional and helpful.
 - Do not use excessive marketing language.
@@ -2474,8 +2477,11 @@ class Automation(GoogleResultsMixin, OutreachChannelsMixin):
                     "\nConfirmed homepage observations (use these as the only source for "
                     "the website issues mentioned to the customer):\n"
                     + "\n".join(f"- {finding}" for finding in audit_findings)
-                    + "\n\nWrite a concise outreach message that says the website review found "
-                    "some issues and briefly names two or three of the confirmed issues. If "
+                    + "\n\nWrite a concise outreach message whose first paragraph explicitly says "
+                    f"that we visited the prospect's website at {website_url or 'the URL listed on Google'} "
+                    "and found the issues that follow. Include that website URL in the "
+                    "customer-facing proposal; do not leave it only in the review context. "
+                    "Briefly name two or three of the confirmed issues. If "
                     "only one issue was confirmed, mention only that issue and do not say "
                     "that there are several. Translate each finding into clear, natural "
                     "business language; for example, say that the homepage is missing a "
@@ -2493,8 +2499,9 @@ class Automation(GoogleResultsMixin, OutreachChannelsMixin):
                 website_requirement = (
                     "\nNo specific issue was safely confirmed by the automated homepage "
                     "check. Do not invent an SEO, responsive-design, performance, or security "
-                    "problem. Offer a deeper review and explain that we can fix any confirmed "
-                    "website issues."
+                    "problem. Explicitly mention the website URL in the customer-facing "
+                    "message, say that we visited it, offer a deeper review, and explain that "
+                    "we can fix any confirmed website issues."
                 )
             if include_software:
                 website_requirement += (
@@ -2666,6 +2673,16 @@ class Automation(GoogleResultsMixin, OutreachChannelsMixin):
                     "AI draft exposed technical audit details; using the customer-friendly issue summary."
                 )
                 return self.fallback_outreach_message(website)
+            if (
+                not partnership_outreach
+                and include_website
+                and website_url
+                and not self.message_mentions_website_url(message, website_url)
+            ):
+                self._log(
+                    "AI draft omitted the reviewed website URL; using the URL-aware local message."
+                )
+                return self.fallback_outreach_message(website)
             return message
         except Exception as exc:
             # Outreach should not stop solely because the optional AI service
@@ -2720,21 +2737,26 @@ class Automation(GoogleResultsMixin, OutreachChannelsMixin):
                 customer_issues = self.audit_customer_issues(findings)[:3]
                 if len(customer_issues) == 1:
                     review_text = (
-                        "we identified an issue: " + customer_issues[0]
+                        "found the following issue: " + customer_issues[0]
                     )
                 else:
-                    issues_text = ", ".join(customer_issues[:-1]) + f", and {customer_issues[-1]}"
-                    review_text = "we identified several issues, including " + issues_text
+                    if len(customer_issues) == 2:
+                        issues_text = f"{customer_issues[0]} and {customer_issues[1]}"
+                    else:
+                        issues_text = ", ".join(customer_issues[:-1]) + f", and {customer_issues[-1]}"
+                    review_text = "found the following issues: " + issues_text
                 website_message = (
                     f"{greeting}\n\n"
-                    f"During a brief review of {website_url or 'your website'}, {review_text}.\n\n"
+                    f"We visited your website at {website_url or 'the URL listed on Google'} "
+                    f"and {review_text}.\n\n"
                     "Our team can fix these website issues and improve the site's clarity, "
                     "usability, and online presence."
                 )
             else:
                 website_message = (
                     f"{greeting}\n\n"
-                    f"We took a brief look at {website_url or 'your website'}. Our automated "
+                    f"We visited your website at {website_url or 'the URL listed on Google'}. "
+                    "Our automated "
                     "homepage check did not confirm a specific issue that would be fair to "
                     "claim without a deeper review. We can perform a closer website review "
                     "and update any confirmed SEO, mobile-usability, performance, or security-"
@@ -2767,6 +2789,16 @@ class Automation(GoogleResultsMixin, OutreachChannelsMixin):
             "operations. Would you be interested in discussing a new website, new or "
             "updated dedicated software, or both?"
         )
+
+    @staticmethod
+    def message_mentions_website_url(message, website_url):
+        """Return whether a draft visibly identifies the reviewed website URL."""
+        text = str(message or "").lower()
+        url = str(website_url or "").strip().lower().rstrip("/")
+        if not url:
+            return True
+        without_scheme = re.sub(r"^https?://", "", url).rstrip("/")
+        return url in text or (without_scheme and without_scheme in text)
 
     @staticmethod
     def business_software_suggestion(website, include_website=True):

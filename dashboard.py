@@ -81,6 +81,9 @@ IMPORTANT:
 - Do not pretend that we know the company's specific problems.
 - Do not make false claims about their current website.
 - Do not say that we noticed problems unless they are explicitly provided.
+- When a website URL and confirmed observations are provided, explicitly mention
+  the URL in the customer-facing message and say that we visited the website
+  before introducing only those confirmed issues.
 - Keep it relatively short.
 - Sound human, professional and helpful.
 - Do not use excessive marketing language.
