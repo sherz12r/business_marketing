@@ -218,7 +218,11 @@ def dashboard_data():
 @app.get("/api/settings")
 @require_auth
 def get_settings():
-    return jsonify(load_config())
+    config = load_config()
+    whatsapp = config.setdefault("whatsapp", {})
+    if isinstance(whatsapp, dict):
+        whatsapp.setdefault("max_successful_sends_per_run", 5)
+    return jsonify(config)
 
 
 @app.put("/api/settings")
@@ -227,6 +231,16 @@ def update_settings():
     config = request.get_json(silent=True)
     if not isinstance(config, dict):
         return jsonify({"error": "Settings must be a JSON object."}), 400
+    whatsapp = config.setdefault("whatsapp", {})
+    if not isinstance(whatsapp, dict):
+        return jsonify({"error": "WhatsApp settings must be an object."}), 400
+    try:
+        whatsapp["max_successful_sends_per_run"] = max(
+            1,
+            int(whatsapp.get("max_successful_sends_per_run", 5)),
+        )
+    except (TypeError, ValueError):
+        return jsonify({"error": "Successful Sends Per Run must be a whole number."}), 400
     try:
         save_config(config)
     except OSError as exc:

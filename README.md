@@ -187,6 +187,8 @@ Review linked devices regularly and remove any server or session you no longer r
 
 WhatsApp Web UI automation can break when WhatsApp changes its interface. For high-volume or business-critical delivery, use the official WhatsApp Business Platform instead of browser automation.
 
+Each automation run stops after 5 confirmed WhatsApp sends by default. Change **Settings → WhatsApp → Successful Sends Per Run** (the `whatsapp.max_successful_sends_per_run` value in `config.json`) when you want a different limit. Failed, skipped, review-only, and unconfirmed attempts do not use the allowance.
+
 ## cPanel deployment
 
 See [CPANEL_DEPLOYMENT.md](CPANEL_DEPLOYMENT.md) for the Passenger setup and cron examples. Before choosing cPanel, ask the provider whether the account supports:

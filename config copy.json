@@ -43,6 +43,7 @@
     "whatsapp": {
         "enabled": true,
         "auto_send": true,
+        "max_successful_sends_per_run": 5,
         "open_for_review": true,
         "keep_tabs_open": false,
         "send_timeout_seconds": 10,

@@ -239,6 +239,7 @@ class Automation(GoogleResultsMixin, OutreachChannelsMixin):
         self.driver = None
         self.whatsapp_login_wait_used = False
         self.whatsapp_window = None
+        self._whatsapp_successful_sends = 0
         self.current_area = {}
 
         if self.mode in {"pending-email", "retry-email"}:
@@ -337,7 +338,12 @@ class Automation(GoogleResultsMixin, OutreachChannelsMixin):
             section["auto_send"] = True
 
         sent_count = 0
+        attempted_count = 0
         for index, row in enumerate(rows, start=1):
+            if channel == "whatsapp" and self.whatsapp_send_limit_reached():
+                self._log(self.whatsapp_send_limit_reason() + "; pending queue stopped.")
+                break
+            attempted_count += 1
             result = self.stored_result(row)
             business_key = row[0]
             self.register_candidate(business_key, {'name': result['name'], 'url': result['website']})
@@ -355,10 +361,16 @@ class Automation(GoogleResultsMixin, OutreachChannelsMixin):
             self.save_outreach(business_key, result)
             sent_count += int(sent)
 
+            if channel == "whatsapp" and self.whatsapp_send_limit_reached():
+                self._log(self.whatsapp_send_limit_reason() + "; pending queue stopped.")
+                break
+
         self._log(
             f"Pending {channel} run completed: {sent_count} sent, "
-            f"{len(rows) - sent_count} skipped or failed."
+            f"{attempted_count - sent_count} skipped or failed, "
+            f"{len(rows) - attempted_count} left pending."
         )
+        return sent_count
 
     def process_retry_channel(self, channel, business_key):
         """Retry one saved draft without regenerating its proposal."""
@@ -1662,6 +1674,9 @@ class Automation(GoogleResultsMixin, OutreachChannelsMixin):
         google_window = self.driver.current_window_handle
         max_pages = max(1, int(self.config.get('google_max_pages', 20)))
         for page_number in range(1, max_pages + 1):
+            if self.whatsapp_send_limit_reached():
+                reason = self.whatsapp_send_limit_reason()
+                break
             self.driver.switch_to.window(google_window)
             if self.google_is_blocked():
                 reason, run_status = 'Google requires consent or CAPTCHA; resolve it in the browser and run again', 'blocked'
@@ -1711,6 +1726,11 @@ class Automation(GoogleResultsMixin, OutreachChannelsMixin):
                 self.db.commit()
                 results.append(result)
                 self.driver.switch_to.window(google_window)
+                if self.whatsapp_send_limit_reached():
+                    reason = self.whatsapp_send_limit_reason()
+                    break
+            if self.whatsapp_send_limit_reached():
+                break
             if processed >= limit:
                 reason = 'Configured business limit reached'
                 break

@@ -7,6 +7,25 @@ from selenium.common.exceptions import TimeoutException
 
 
 class OutreachChannelsMixin:
+    def whatsapp_send_limit(self):
+        """Maximum number of confirmed WhatsApp sends allowed in one run."""
+        try:
+            value = int(self.get_section_setting(
+                'whatsapp', 'max_successful_sends_per_run', default=5
+            ))
+        except (TypeError, ValueError):
+            value = 5
+        return max(1, value)
+
+    def whatsapp_send_limit_reached(self):
+        return getattr(self, '_whatsapp_successful_sends', 0) >= self.whatsapp_send_limit()
+
+    def whatsapp_send_limit_reason(self):
+        return (
+            f"WhatsApp successful message limit reached "
+            f"({self.whatsapp_send_limit()} per run)"
+        )
+
     def email_sending_enabled(self):
         """Fail closed and honor config changes made during an active run."""
         config = self.config
@@ -125,6 +144,13 @@ class OutreachChannelsMixin:
         return numbers, usable, candidates
 
     def send_whatsapp_message(self, result, business_key):
+        if self.whatsapp_send_limit_reached():
+            return self.channel_outcome(
+                result,
+                'whatsapp',
+                'limit_reached',
+                self.whatsapp_send_limit_reason(),
+            )
         if self.recent_channel_events(business_key, EVENT_WHATSAPP_SENT):
             result['whatsapp_sent'] = True
             return self.channel_outcome(result, 'whatsapp', 'already_sent', 'Within configured contact cooldown')
@@ -147,7 +173,12 @@ class OutreachChannelsMixin:
                 result['phones'] = [phone]
                 result['_whatsapp_send_clicked'] = False
                 if self._send_whatsapp_to_phone(result, business_key):
+                    self._whatsapp_successful_sends = (
+                        getattr(self, '_whatsapp_successful_sends', 0) + 1
+                    )
                     self.channel_outcome(result, 'whatsapp', 'sent')
+                    if self.whatsapp_send_limit_reached():
+                        self._log(self.whatsapp_send_limit_reason() + '; stopping WhatsApp automation.')
                     return True
                 status = result.get('channel_status', {}).get('whatsapp', {}).get('status')
                 if result.get('_whatsapp_send_clicked') or status in {'disabled','review','no_message','configuration_missing'}:
