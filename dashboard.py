@@ -18,6 +18,7 @@ from urllib.parse import quote_plus, urlparse
 import tkinter as tk
 
 from app_paths import get_app_dir
+from automation_lock import automation_running
 from campaign import campaign_stats
 from process_utils import process_running
 from outreach_text import clean_outreach_message
@@ -2057,6 +2058,13 @@ class MarketingDashboard(tk.Tk):
                 "Automation already running",
                 "Another automation was started from the web dashboard "
                 f"(PID {other_run['pid']}). Stop it before starting this run."
+            )
+            self.status_var.set("Another automation is running")
+            return
+        if automation_running():
+            messagebox.showwarning(
+                "Automation already running",
+                "Another automation is already running. Stop it or wait for it to finish before starting a new run."
             )
             self.status_var.set("Another automation is running")
             return

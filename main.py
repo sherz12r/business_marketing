@@ -30,6 +30,7 @@ from google_results import GoogleResultsMixin
 from outreach_channels import OutreachChannelsMixin
 from outreach_text import clean_outreach_message
 from app_paths import get_app_dir
+from automation_lock import AutomationLock
 from campaign import load_location_catalog, seed_target_areas
 from progress_tracker import (
     EVENT_EMAIL_SENT,
@@ -2450,6 +2451,12 @@ class Automation(GoogleResultsMixin, OutreachChannelsMixin):
             )
             prompt = DEFAULT_PROPOSAL_PROMPT.format_map(prompt_values)
 
+        prompt += (
+            "\n\nPLAIN-TEXT OUTPUT REQUIREMENT:\n"
+            "Return plain text only. Write every website URL once as an ordinary URL. "
+            "Do not use Markdown links such as [label](URL) or <URL>."
+        )
+
         if partnership_outreach:
             prompt += (
                 "\n\nPARTNERSHIP OUTREACH REQUIREMENT:\n"
@@ -3243,6 +3250,7 @@ class Automation(GoogleResultsMixin, OutreachChannelsMixin):
 
             if state == "available":
                 result["_verified_whatsapp_phone"] = phone
+                result["_whatsapp_chat_ready_phone"] = phone
                 self.channel_outcome(result, "whatsapp", "available", reason)
                 return phone
             saw_failure = saw_failure or state == "failed"
@@ -3328,6 +3336,41 @@ class Automation(GoogleResultsMixin, OutreachChannelsMixin):
         else:
             result["status"] = "draft_ready" if result.get('proposal') else "draft_error"
 
+    def fill_whatsapp_composer(self, message, timeout=30):
+        """Fill the composer in an already validated chat without reloading it."""
+        selectors = (
+            "#main footer div[contenteditable='true'][role='textbox']",
+            "#main footer [contenteditable='true']",
+            "[data-testid='conversation-compose-box-input']",
+        )
+
+        def visible_composer(driver):
+            for selector in selectors:
+                try:
+                    for element in driver.find_elements(By.CSS_SELECTOR, selector):
+                        if element.is_displayed() and element.is_enabled():
+                            return element
+                except Exception:
+                    continue
+            return False
+
+        try:
+            composer = WebDriverWait(self.driver, timeout).until(visible_composer)
+            composer.click()
+            composer.send_keys(Keys.CONTROL, "a")
+            composer.send_keys(Keys.BACKSPACE)
+            lines = re.split(r"\r?\n", str(message or ""))
+            for index, line in enumerate(lines):
+                if line:
+                    composer.send_keys(line)
+                if index < len(lines) - 1:
+                    composer.send_keys(Keys.SHIFT, Keys.ENTER)
+            self._log("Filled the existing validated WhatsApp chat without reopening it.")
+            return True
+        except Exception as exc:
+            self._log(f"Could not fill the existing WhatsApp chat: {exc}")
+            return False
+
     def _send_whatsapp_to_phone(self, result, business_key):
         if not self.get_bool_setting(
             "whatsapp",
@@ -3401,16 +3444,25 @@ class Automation(GoogleResultsMixin, OutreachChannelsMixin):
         try:
             original_window = self.driver.current_window_handle
             existing_whatsapp = getattr(self, "whatsapp_window", None)
+            validated_chat_ready = bool(
+                reuse_tab
+                and existing_whatsapp in self.driver.window_handles
+                and result.get("_whatsapp_chat_ready_phone") == phone
+            )
             if reuse_tab and existing_whatsapp in self.driver.window_handles:
                 whatsapp_window = existing_whatsapp
                 self.driver.switch_to.window(whatsapp_window)
-                self._log("Reusing the existing WhatsApp tab.")
+                if validated_chat_ready:
+                    self._log("Continuing in the validated WhatsApp chat.")
+                else:
+                    self._log("Reusing the existing WhatsApp tab.")
             else:
                 self.driver.switch_to.new_window("tab")
                 whatsapp_window = self.driver.current_window_handle
                 if reuse_tab:
                     self.whatsapp_window = whatsapp_window
-            self.driver.get(url)
+            if not validated_chat_ready:
+                self.driver.get(url)
 
             WebDriverWait(
                 self.driver,
@@ -3429,6 +3481,15 @@ class Automation(GoogleResultsMixin, OutreachChannelsMixin):
                 self._log(
                     f"Waiting up to {login_timeout} seconds for the first WhatsApp login..."
                 )
+
+            if validated_chat_ready and outgoing_text:
+                if not self.fill_whatsapp_composer(outgoing_text, timeout=button_timeout):
+                    return self.channel_outcome(
+                        result,
+                        "whatsapp",
+                        "failed",
+                        "Validated chat was ready, but the message composer could not be filled",
+                    )
 
             if image_path:
                 if not self.upload_whatsapp_image(image_path, timeout=button_timeout):
@@ -5101,7 +5162,15 @@ if __name__ == "__main__":
     elif "--retry-email" in sys.argv:
         mode = "retry-email"
         retry_business_key = sys.argv[sys.argv.index("--retry-email") + 1]
-    print(f"[Marketing Bot] Launching {mode}...", flush=True)
-    automation = Automation(mode=mode, retry_business_key=retry_business_key)
-    print("[Marketing Bot] Session ended.", flush=True)
+    with AutomationLock() as run_lock:
+        if not run_lock:
+            print(
+                "[Marketing Bot] Another automation is already running. "
+                "Wait for it to finish or stop it before starting a new run.",
+                flush=True,
+            )
+            raise SystemExit(2)
+        print(f"[Marketing Bot] Launching {mode}...", flush=True)
+        automation = Automation(mode=mode, retry_business_key=retry_business_key)
+        print("[Marketing Bot] Session ended.", flush=True)
 

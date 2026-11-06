@@ -18,12 +18,14 @@ from flask import Flask, Response, jsonify, render_template, request
 from dotenv import load_dotenv
 
 from app_paths import get_app_dir
+from automation_lock import automation_running
 from campaign import campaign_stats, load_location_catalog, seed_target_areas
 from process_utils import process_running
 from outreach_text import clean_outreach_message
 from progress_tracker import (
     EVENT_EMAIL_SENT,
     EVENT_FORM_PREFILLED,
+    EVENT_LINKEDIN_SENT,
     EVENT_WEBSITE_OPENED,
     EVENT_WHATSAPP_SENT,
     ensure_database,
@@ -140,6 +142,76 @@ def database():
     return connection
 
 
+CONTACTED_SQL = """(
+    COALESCE(o.status, '') IN ('email_sent', 'whatsapp_sent', 'fallback_sent', 'submitted', 'sent')
+    OR EXISTS (
+        SELECT 1 FROM outreach_events contacted_event
+         WHERE contacted_event.business_key = o.business_key
+           AND contacted_event.event_type IN (?, ?, ?)
+    )
+)"""
+
+
+def select_leads(connection, contact_group="", limit=None):
+    """Return dashboard lead rows, optionally filtered by outreach state."""
+    where = ""
+    contact_parameters = []
+    if contact_group == "contacted":
+        where = f"WHERE {CONTACTED_SQL}"
+        contact_parameters = [EVENT_EMAIL_SENT, EVENT_WHATSAPP_SENT, EVENT_LINKEDIN_SENT]
+    elif contact_group == "not-contacted":
+        where = f"WHERE NOT {CONTACTED_SQL}"
+        contact_parameters = [EVENT_EMAIL_SENT, EVENT_WHATSAPP_SENT, EVENT_LINKEDIN_SENT]
+    elif contact_group:
+        raise ValueError("Unknown contact group")
+
+    query = f"""SELECT o.*, t.country area_country, t.region area_region,
+                t.city area_city, t.area area_name,
+                MAX(CASE WHEN e.event_type = ? THEN e.created_at END) email_sent_at,
+                MAX(CASE WHEN e.event_type = ? THEN e.created_at END) whatsapp_sent_at
+               FROM outreach o LEFT JOIN outreach_events e ON e.business_key=o.business_key
+               LEFT JOIN target_areas t ON t.area_key=o.area_key
+               {where}
+              GROUP BY o.business_key ORDER BY COALESCE(o.updated_at, '') DESC"""
+    parameters = [EVENT_EMAIL_SENT, EVENT_WHATSAPP_SENT, *contact_parameters]
+    if limit is not None:
+        query += " LIMIT ?"
+        parameters.append(int(limit))
+    return connection.execute(query, parameters).fetchall()
+
+
+def serialize_lead(row):
+    try:
+        channel_status = json.loads(row["channel_status"] or "{}")
+    except (TypeError, ValueError):
+        channel_status = {}
+    if not isinstance(channel_status, dict):
+        channel_status = {}
+    return {
+        "key": row["business_key"],
+        "name": row["business_name"] or "Unnamed business",
+        "website": row["website"] or "",
+        "contact_page": row["contact_page"] or "",
+        "emails": parse_list(row["emails"]),
+        "phones": parse_list(row["phones"]),
+        "whatsapp_phones": parse_list(row["whatsapp_phones"]),
+        "proposal": clean_outreach_message(row["proposal"]),
+        "status": row["status"] or "draft_ready",
+        "channel_status": channel_status,
+        "form_prefilled": bool(row["form_prefilled"]),
+        "last_error": row["last_error"] or "",
+        "updated": row["updated_at"] or "",
+        "country": row["area_country"] or "",
+        "region": row["area_region"] or "",
+        "city": row["area_city"] or "",
+        "area": row["area_name"] or "",
+        "email_sent": bool(row["email_sent_at"]) or row["status"] in {"email_sent", "fallback_sent"},
+        "whatsapp_sent": bool(row["whatsapp_sent_at"]) or row["status"] in {"whatsapp_sent", "fallback_sent"},
+        "email_sent_at": row["email_sent_at"] or "",
+        "whatsapp_sent_at": row["whatsapp_sent_at"] or "",
+    }
+
+
 @app.get("/")
 @require_auth
 def index():
@@ -166,16 +238,7 @@ def dashboard_data():
                 )
             except (OSError, ValueError, json.JSONDecodeError):
                 pass
-        rows = connection.execute(
-            """SELECT o.*, t.country area_country, t.region area_region,
-                t.city area_city, t.area area_name,
-                MAX(CASE WHEN e.event_type = ? THEN e.created_at END) email_sent_at,
-                MAX(CASE WHEN e.event_type = ? THEN e.created_at END) whatsapp_sent_at
-               FROM outreach o LEFT JOIN outreach_events e ON e.business_key=o.business_key
-               LEFT JOIN target_areas t ON t.area_key=o.area_key
-              GROUP BY o.business_key ORDER BY COALESCE(o.updated_at, '') DESC LIMIT 250""",
-            (EVENT_EMAIL_SENT, EVENT_WHATSAPP_SENT),
-        ).fetchall()
+        rows = select_leads(connection, limit=250)
         totals, run = outreach_stats(connection)
         campaign = campaign_stats(connection)
         areas = [dict(row) for row in connection.execute(
@@ -184,34 +247,22 @@ def dashboard_data():
                FROM target_areas ORDER BY country,position,area_key"""
         ).fetchall()]
 
-    leads = []
-    for row in rows:
-        leads.append({
-            "key": row["business_key"],
-            "name": row["business_name"] or "Unnamed business",
-            "website": row["website"] or "",
-            "contact_page": row["contact_page"] or "",
-            "emails": parse_list(row["emails"]),
-            "phones": parse_list(row["phones"]),
-            "whatsapp_phones": parse_list(row["whatsapp_phones"]),
-            "proposal": clean_outreach_message(row["proposal"]),
-            "status": row["status"] or "draft_ready",
-            "channel_status": json.loads(row["channel_status"] or "{}"),
-            "form_prefilled": bool(row["form_prefilled"]),
-            "last_error": row["last_error"] or "",
-            "updated": row["updated_at"] or "",
-            "country": row["area_country"] or "",
-            "region": row["area_region"] or "",
-            "city": row["area_city"] or "",
-            "area": row["area_name"] or "",
-            "email_sent": bool(row["email_sent_at"]) or row["status"] in {"email_sent", "fallback_sent"},
-            "whatsapp_sent": bool(row["whatsapp_sent_at"]) or row["status"] in {"whatsapp_sent", "fallback_sent"},
-            "email_sent_at": row["email_sent_at"] or "",
-            "whatsapp_sent_at": row["whatsapp_sent_at"] or "",
-        })
+    leads = [serialize_lead(row) for row in rows]
     stats = {**totals, "leads": totals['businesses']}
     return jsonify({"stats": stats, "run": run, "campaign": campaign, "areas": areas,
                     "leads": leads, "job": job_status()})
+
+
+@app.get("/api/leads")
+@require_auth
+def lead_list():
+    contact_group = str(request.args.get("group", "")).strip().lower()
+    if contact_group not in {"contacted", "not-contacted"}:
+        return jsonify({"error": "Choose contacted or not-contacted leads."}), 400
+    with closing(database()) as connection:
+        rows = select_leads(connection, contact_group=contact_group)
+    return jsonify({"group": contact_group, "count": len(rows),
+                    "leads": [serialize_lead(row) for row in rows]})
 
 
 
@@ -290,6 +341,8 @@ def start_job():
     current = job_status()
     if current.get("running"):
         return jsonify({"error": "An automation job is already running."}), 409
+    if automation_running():
+        return jsonify({"error": "Another automation is already running outside this dashboard."}), 409
 
     mode = (request.get_json(silent=True) or {}).get("mode", "full")
     if mode == "pending-email" and not email_sending_enabled():
@@ -312,6 +365,8 @@ def retry_lead(business_key):
     current = job_status()
     if current.get("running"):
         return jsonify({"error": "An automation job is already running."}), 409
+    if automation_running():
+        return jsonify({"error": "Another automation is already running outside this dashboard."}), 409
 
     channel = str((request.get_json(silent=True) or {}).get("channel", "")).lower()
     if channel not in {"email", "whatsapp"}:

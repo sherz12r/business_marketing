@@ -32,3 +32,18 @@ dialog{width:min(920px,calc(100% - 24px));height:min(760px,calc(100% - 24px));pa
 .saved-message pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#07111e;border:1px solid var(--line);border-radius:12px;padding:16px;color:#d8e4f1;font:13px/1.6 inherit}
 .detail-actions{display:flex;gap:10px;flex-wrap:wrap;margin-top:16px}
 @media(max-width:600px){.detail-row{grid-template-columns:1fr;gap:3px}.detail-actions button{width:100%}}
+
+/* Clickable outreach totals and their complete lead lists. */
+.stats .stat-card{min-height:0;padding:18px;text-align:left;position:relative;background:linear-gradient(145deg,rgba(18,32,50,.96),rgba(12,24,40,.96));border:1px solid var(--line);border-radius:18px}
+.stats .stat-card:hover,.stats .stat-card:focus-visible{border-color:var(--blue);transform:translateY(-1px)}
+.stats .stat-card small{display:block;color:var(--blue);font-size:10px;margin-top:5px}
+.stats .stat-card.contacted strong{color:var(--mint)}
+.stats .stat-card.pending strong{color:var(--amber)}
+.contact-list-dialog{height:min(860px,calc(100% - 24px));width:min(1100px,calc(100% - 24px));display:none;grid-template-rows:auto auto minmax(0,1fr)}
+.contact-list-dialog[open]{display:grid}
+.contact-list-header{border-bottom:1px solid var(--line)}
+.contact-list-header .list-note{margin-top:4px}
+.contact-list-tools{padding:12px 20px;border-bottom:1px solid var(--line)}
+.contact-list-tools input{width:min(420px,100%)}
+.contact-lead-list{max-height:none;padding:16px 20px 20px}
+@media(max-width:600px){.contact-list-tools,.contact-lead-list{padding-left:14px;padding-right:14px}.stats .stat-card{padding:14px}}

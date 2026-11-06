@@ -30,6 +30,22 @@ _CONTENT_LABEL = re.compile(
     re.IGNORECASE,
 )
 _SUBJECT_LINE = re.compile(r"^\s*(?:\*{0,2})subject(?:\*{0,2})\s*:", re.IGNORECASE)
+_MARKDOWN_LINK = re.compile(
+    r"\[([^\]\n]+)\]\(\s*<?(https?://[^\s)>]+)>?\s*\)",
+    re.IGNORECASE,
+)
+_MARKDOWN_AUTOLINK = re.compile(r"<((?:https?://)[^\s<>]+)>", re.IGNORECASE)
+
+
+def _plain_text_link(match) -> str:
+    """Flatten a Markdown link without printing the same URL twice."""
+    label = match.group(1).strip()
+    url = match.group(2).strip()
+    normalized_label = label.lower().rstrip("/")
+    normalized_url = url.lower().rstrip("/")
+    if normalized_label == normalized_url:
+        return url
+    return f"{label} ({url})"
 
 
 def clean_outreach_message(value) -> str:
@@ -82,6 +98,8 @@ def clean_outreach_message(value) -> str:
 
     result = "\n".join(lines).strip()
     result = re.sub(r"\n[ \t]*\n(?:[ \t]*\n)+", "\n\n", result)
+    result = _MARKDOWN_LINK.sub(_plain_text_link, result)
+    result = _MARKDOWN_AUTOLINK.sub(r"\1", result)
     if len(result) >= 2 and result[0] == result[-1] and result[0] in {'"', "'"}:
         result = result[1:-1].strip()
     return result
